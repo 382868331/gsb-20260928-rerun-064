@@ -1,0 +1,53 @@
+{
+  "id_field": "emp_id",
+  "schema": {
+    "emp_id": "string",
+    "name": "string",
+    "hire_date": "date",
+    "leave_date": "date",
+    "age": "number",
+    "years_service": "number"
+  },
+  "records": [
+    {
+      "emp_id": "E001",
+      "name": "Zhang San",
+      "hire_date": "2020-01-10",
+      "leave_date": "2023-05-01",
+      "age": 35,
+      "years_service": 3
+    },
+    {
+      "emp_id": "E002",
+      "name": "Li Si",
+      "hire_date": "2024-03-01",
+      "leave_date": "2022-01-01",
+      "age": 28,
+      "years_service": 1
+    },
+    {
+      "emp_id": "E002",
+      "name": "Li Si Duplicate",
+      "hire_date": "2024-03-01",
+      "leave_date": null,
+      "age": "not-a-number",
+      "years_service": 1
+    },
+    {
+      "emp_id": "E003",
+      "name": "Wang Wu",
+      "hire_date": null,
+      "leave_date": "2025-01-01",
+      "age": 42,
+      "years_service": 10
+    },
+    {
+      "emp_id": "E004",
+      "name": "Zhao Liu",
+      "hire_date": "2019-06-01",
+      "leave_date": "bad-date",
+      "age": 30,
+      "years_service": 5
+    }
+  ]
+}
