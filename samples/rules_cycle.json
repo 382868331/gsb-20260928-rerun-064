@@ -1,0 +1,8 @@
+{
+  "version_set": "rules-cycle",
+  "rules": [
+    {"id": "a", "type": "required_fields", "fields": ["id"], "depends_on": ["c"]},
+    {"id": "b", "type": "required_fields", "fields": ["id"], "depends_on": ["a"]},
+    {"id": "c", "type": "required_fields", "fields": ["id"], "depends_on": ["b"]}
+  ]
+}

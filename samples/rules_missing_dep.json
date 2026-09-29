@@ -1,0 +1,6 @@
+{
+  "version_set": "rules-missing-dep",
+  "rules": [
+    {"id": "a", "type": "required_fields", "fields": ["id"], "depends_on": ["ghost"]}
+  ]
+}
