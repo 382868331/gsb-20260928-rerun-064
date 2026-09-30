@@ -81,6 +81,11 @@ class RunResult:
     status: str  # PASSED | FAILED
     issues: tuple
     errors: tuple
+    # Rules whose evaluation finished this run. A rule listed in
+    # incomplete_rules failed mid-run: its previous conclusion (if any)
+    # is kept and the run must not be treated as covering that scope.
+    completed_rules: tuple = ()
+    incomplete_rules: tuple = ()
 
     def to_dict(self):
         d = asdict(self)

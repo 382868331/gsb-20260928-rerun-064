@@ -206,9 +206,11 @@ def evaluate(batch, rules):
             status="FAILED",
             issues=(),
             errors=(str(exc),),
+            incomplete_rules=tuple(rule.rule_id for rule in rules),
         )
 
-    failed_records = set()
+    completed = []
+    incomplete = []
     for rule in ordered:
         # A rule is skipped for records already failed by a prerequisite.
         relevant = tuple(
@@ -221,14 +223,16 @@ def evaluate(batch, rules):
         handler = CHECKS.get(rule.rule_type)
         if handler is None:
             errors.append(f"unknown rule type {rule.rule_type!r} ({rule.rule_id})")
+            incomplete.append(rule.rule_id)
             continue
         try:
             produced = handler(rule, relevant)
         except Exception as exc:  # execution failure -> never "all passed"
             errors.append(f"rule {rule.rule_id!r} failed to execute: {exc}")
+            incomplete.append(rule.rule_id)
             continue
         issues.extend(produced)
-        failed_records.update(i.record_id for i in produced)
+        completed.append(rule.rule_id)
 
     finished = utc_now()
     status = "FAILED" if issues or errors else "PASSED"
@@ -242,4 +246,6 @@ def evaluate(batch, rules):
         status=status,
         issues=tuple(issues),
         errors=tuple(errors),
+        completed_rules=tuple(completed),
+        incomplete_rules=tuple(incomplete),
     )

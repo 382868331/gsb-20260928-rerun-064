@@ -29,6 +29,36 @@ python -m dq_platform.cli --sample samples/clean.json --rules samples/rules_v1.j
 结果以 JSONL 追加写入 `results/runs.jsonl`，键为 `batch_id + 规则版本集 +
 时间戳`。修订规则后用新的 `version_set` 重新检查，旧批次结论保留不变。
 
+## 增量检查（第二轮）
+
+同一批次只改了少量记录时，用 `--prev-sample` 指向上一次样本，引擎按差异
+决定每条规则的重判范围：
+
+```bash
+python -m dq_platform.cli --sample samples/employees_v2.json --batch-id employees_v1 --prev-sample samples/employees_v1.json --rules samples/rules_v1.json --out results --lifecycle
+```
+
+- 行级规则（`required_fields`、`date_order`）只重判改动/新增的记录；
+  跨记录规则（`unique_fields`）因分组可能整体变化而全量重判该规则；
+  依赖被全量重判的规则会级联全量。未触及的规则直接沿用上次结论。
+- 规则版本集变化（判断条件改变）时自动回退为完整重算。
+- 规则执行中途失败：该规则保留上一份有效结论，运行结果的
+  `incomplete_rules` 与错误信息明确列出本次没有完成的范围，状态仍为
+  FAILED，绝不会报“全部合格”。
+
+## 问题生命周期
+
+`--lifecycle` 把每次运行折叠进 `results/issues.jsonl` 追加账本：
+
+- `opened` / `resolved`：解决的问题保留原始记录，并记录解决它的
+  运行与规则版本，不会从历史中消失。
+- `reopened`：同一问题（规则+记录+字段+类型）再次出现记为重新打开，
+  而不是新问题。
+- `condition_changed`：问题仍在但规则版本集已变，区分“判断条件改变”
+  与“问题重新出现”。
+- 执行失败的规则：其未结问题标记为 `unknown`，既不被误记为已解决，
+  也不会被重复打开。
+
 ## 测试
 
 ```bash
@@ -37,3 +67,6 @@ python -m unittest discover -s tests -v
 
 覆盖重复身份、相互矛盾日期、依赖成环、缺失依赖、缺失/脏值不按零值处理，
 以及旧批次结论不被覆盖。
+
+第二轮新增：增量结果与完整重算一致、仅重判受影响范围、问题解决/重开/条件
+变化的生命周期，以及中途失败保留旧结论并标明未完成范围，均有测试覆盖。
