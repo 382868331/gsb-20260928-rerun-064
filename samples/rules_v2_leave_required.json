@@ -1,0 +1,25 @@
+{
+  "version_set": "rules-2024-v2",
+  "rules": [
+    {
+      "id": "identity_present",
+      "type": "required_fields",
+      "fields": ["id", "id_card"]
+    },
+    {
+      "id": "identity_unique",
+      "type": "unique_fields",
+      "params": {"key_fields": ["id_card"]},
+      "depends_on": ["identity_present"]
+    },
+    {
+      "id": "employment_dates_consistent",
+      "type": "date_order",
+      "params": {
+        "early_field": "hire_date",
+        "late_field": "leave_date",
+        "optional_fields": []
+      }
+    }
+  ]
+}

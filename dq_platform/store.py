@@ -7,6 +7,8 @@ run and never overwrites an earlier batch conclusion.
 import json
 from pathlib import Path
 
+from .models import RunResult
+
 
 class ResultStore:
     def __init__(self, root):
@@ -25,7 +27,21 @@ class ResultStore:
         with self.path.open("r", encoding="utf-8") as handle:
             return [json.loads(line) for line in handle if line.strip()]
 
+    def load_results(self):
+        return [RunResult.from_dict(doc) for doc in self.load_all()]
+
     def conclusions_for_batch(self, batch_id):
         return [
             doc for doc in self.load_all() if doc["batch_id"] == batch_id
         ]
+
+    def latest_valid_for_batch(self, batch_id):
+        """Most recent run that completed every rule (no incomplete scope)."""
+        candidates = [
+            result for result in self.load_results()
+            if result.batch_id == batch_id and not result.incomplete_scope
+        ]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda result: result.started_at)
+        return candidates[-1]
