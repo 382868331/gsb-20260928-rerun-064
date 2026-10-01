@@ -9,6 +9,8 @@ sys.path.insert(0, str(ROOT))
 
 from dq_platform.engine import evaluate
 from dq_platform.incremental import (
+    build_plan,
+    describe_plan,
     diff_batches,
     incremental_evaluate,
     plan_scopes,
@@ -52,32 +54,147 @@ class IncrementalTests(unittest.TestCase):
         self.assertEqual(incr.incomplete_rules, ())
 
     def test_only_affected_scopes_are_rerun(self):
-        changed, added, removed = diff_batches(self.batch_v1, self.batch_v2)
-        scopes = plan_scopes(self.rules, changed, added, removed)
-        # Row-level rule: only the two edited records are re-judged.
-        self.assertEqual(scopes["identity_present"], "records")
-        # Cross-record uniqueness must be re-judged as a whole.
-        self.assertEqual(scopes["identity_unique"], "full")
+        # v1 -> v2 edits only date cells on E002/E004: identity rules have
+        # nothing to redo, the date rule re-judges exactly those records.
+        scopes = plan_scopes(self.rules, self.batch_v1, self.batch_v2)
+        self.assertEqual(scopes["identity_present"], "skip")
+        self.assertEqual(scopes["identity_unique"], "skip")
         self.assertEqual(scopes["employment_dates_consistent"], "records")
+        plans = {
+            p.rule_id: p
+            for p in build_plan(self.rules, self.batch_v1, self.batch_v2)
+        }
+        self.assertEqual(
+            plans["employment_dates_consistent"].targets, ("E002", "E004")
+        )
 
     def test_untouched_change_skips_unaffected_rules(self):
-        # Edit only a date cell: identity rules have nothing to redo.
+        # Edit only a date cell: identity rules are skipped entirely, not
+        # re-labelled full runs.
         data = [dict(r.data) for r in self.batch_v1.records]
         data[0]["leave_date"] = "2024-06-01"
         path = Path(tempfile.mkdtemp()) / "b.json"
         path.write_text(json.dumps(data))
         batch_b = load_batch(path, batch_id=self.batch_v1.batch_id)
-        changed, added, removed = diff_batches(self.batch_v1, batch_b)
-        scopes = plan_scopes(self.rules, changed, added, removed)
-        self.assertEqual(scopes["identity_present"], "records")
-        self.assertEqual(scopes["identity_unique"], "full")
+        scopes = plan_scopes(self.rules, self.batch_v1, batch_b)
+        self.assertEqual(scopes["identity_present"], "skip")
+        self.assertEqual(scopes["identity_unique"], "skip")
         self.assertEqual(scopes["employment_dates_consistent"], "records")
         incr = incremental_evaluate(self.prev, self.batch_v1, batch_b, self.rules)
         full = evaluate(batch_b, self.rules)
         self.assertEqual(issue_tuples(incr), issue_tuples(full))
 
+    def _batch_with(self, mutate):
+        data = [dict(r.data) for r in self.batch_v1.records]
+        mutate(data)
+        path = Path(tempfile.mkdtemp()) / "b.json"
+        path.write_text(json.dumps(data))
+        return load_batch(path, batch_id=self.batch_v1.batch_id)
+
+    def test_identity_change_limited_to_affected_groups(self):
+        # E001 gets a fresh unique id_card: only its own group is re-judged.
+        batch_b = self._batch_with(
+            lambda d: d[0].update(id_card="999999999999999999")
+        )
+        plans = {
+            p.rule_id: p
+            for p in build_plan(self.rules, self.batch_v1, batch_b)
+        }
+        plan = plans["identity_unique"]
+        self.assertEqual(plan.scope, "groups")
+        self.assertEqual(plan.targets, ("E001",))
+        # The untouched duplicate group {E003, E004} is NOT re-scanned.
+        self.assertNotIn("E003", plan.targets)
+        self.assertNotIn("E004", plan.targets)
+        incr = incremental_evaluate(self.prev, self.batch_v1, batch_b, self.rules)
+        full = evaluate(batch_b, self.rules)
+        self.assertEqual(issue_tuples(incr), issue_tuples(full))
+
+    def test_identity_change_into_existing_group_finds_conflict(self):
+        # E001 takes E002's id_card: the conflict must be found even though
+        # only two records are re-judged.
+        batch_b = self._batch_with(
+            lambda d: d[0].update(id_card=d[1]["id_card"])
+        )
+        plans = {
+            p.rule_id: p
+            for p in build_plan(self.rules, self.batch_v1, batch_b)
+        }
+        self.assertEqual(plans["identity_unique"].scope, "groups")
+        self.assertEqual(
+            set(plans["identity_unique"].targets), {"E001", "E002"}
+        )
+        incr = incremental_evaluate(self.prev, self.batch_v1, batch_b, self.rules)
+        full = evaluate(batch_b, self.rules)
+        self.assertEqual(issue_tuples(incr), issue_tuples(full))
+        dupes = {
+            i.record_id for i in incr.issues
+            if i.rule_id == "identity_unique" and i.kind == "violated"
+        }
+        self.assertIn("E001", dupes)
+        self.assertIn("E002", dupes)
+
+    def test_removed_record_shrinks_only_its_group(self):
+        # Removing E004 dissolves the {E003, E004} duplicate: E003's carried
+        # issue must be dropped without re-scanning unrelated groups.
+        batch_b = self._batch_with(lambda d: d.pop(3))
+        plans = {
+            p.rule_id: p
+            for p in build_plan(self.rules, self.batch_v1, batch_b)
+        }
+        plan = plans["identity_unique"]
+        self.assertEqual(plan.scope, "groups")
+        self.assertEqual(set(plan.targets), {"E003"})
+        incr = incremental_evaluate(self.prev, self.batch_v1, batch_b, self.rules)
+        full = evaluate(batch_b, self.rules)
+        self.assertEqual(issue_tuples(incr), issue_tuples(full))
+        self.assertEqual(
+            [i for i in incr.issues
+             if i.rule_id == "identity_unique" and i.kind == "violated"],
+            [],
+        )
+
+    def test_plan_explains_each_change_kind(self):
+        batch_b = self._batch_with(
+            lambda d: d[0].update(id_card="999999999999999999")
+        )
+        plans = build_plan(self.rules, self.batch_v1, batch_b)
+        lines = chr(10).join(describe_plan(plans, prev_result=self.prev))
+        self.assertIn("identity_unique", lines)
+        self.assertIn("modified relevant fields: E001 (id_card)", lines)
+        self.assertIn("affected identity groups", lines)
+        self.assertIn("was: completed", lines)
+        # Added/removed/rule-change reasons appear when applicable.
+        added = self._batch_with(
+            lambda d: d.append({"id": "E006", "id_card": "1"})
+        )
+        add_plans = build_plan(self.rules, self.batch_v1, added)
+        add_text = chr(10).join(
+            r for p in add_plans for r in p.reasons
+        )
+        self.assertIn("added records: E006", add_text)
+        removed = self._batch_with(lambda d: d.pop(0))
+        rm_plans = build_plan(self.rules, self.batch_v1, removed)
+        rm_text = chr(10).join(r for p in rm_plans for r in p.reasons)
+        self.assertIn("removed records: E001", rm_text)
+        _, rules_v2 = load_rule_set(SAMPLES / "rules_v2.json")
+        ch_plans = {
+            p.rule_id: p
+            for p in build_plan(
+                rules_v2, self.batch_v1, self.batch_v2, prev_rules=self.rules
+            )
+        }
+        # Only the rule whose definition actually changed goes full.
+        self.assertEqual(
+            ch_plans["employment_dates_consistent"].scope, "full"
+        )
+        self.assertIn(
+            "rule definition changed",
+            ch_plans["employment_dates_consistent"].reasons[0],
+        )
+
     def test_no_change_skips_everything(self):
-        scopes = plan_scopes(self.rules, (), (), ())
+        scopes = plan_scopes(self.rules, self.batch_v1, self.batch_v1)
         self.assertTrue(all(s == "skip" for s in scopes.values()))
         incr = incremental_evaluate(
             self.prev, self.batch_v1, self.batch_v1, self.rules
@@ -124,6 +241,73 @@ class IncrementalTests(unittest.TestCase):
         self.assertIn("NOT completed", result.errors[0])
         # Other rules still got an incremental, correct verdict.
         self.assertIn("identity_unique", result.completed_rules)
+
+
+    def _broken_date_rule(self):
+        return type(self.rules[2])(
+            rule_id=self.rules[2].rule_id,
+            rule_type=self.rules[2].rule_type,
+            version_set=self.rules[2].version_set,
+            fields=self.rules[2].fields,
+            params={},
+            depends_on=(),
+        )
+
+    def test_recovery_rechecks_previously_failed_scope(self):
+        first = evaluate(self.batch_v1, self.rules)
+        rules_broken = self.rules[:2] + (self._broken_date_rule(),)
+        failed = incremental_evaluate(
+            first, self.batch_v1, self.batch_v2, rules_broken
+        )
+        self.assertEqual(failed.incomplete_rules,
+                         ("employment_dates_consistent",))
+        # Recovery run: no data changed since the failed run, yet the
+        # previously incomplete rule must be re-checked in full -- its kept
+        # conclusion is stale and must not count as this run's verdict.
+        recovered = incremental_evaluate(
+            failed, self.batch_v2, self.batch_v2, self.rules
+        )
+        full = evaluate(self.batch_v2, self.rules)
+        self.assertEqual(issue_tuples(recovered), issue_tuples(full))
+        self.assertEqual(recovered.status, full.status)
+        self.assertEqual(recovered.errors, ())
+        self.assertEqual(recovered.incomplete_rules, ())
+        self.assertIn("employment_dates_consistent", recovered.completed_rules)
+        plan = {entry["rule_id"]: entry for entry in recovered.plan}
+        self.assertEqual(
+            plan["employment_dates_consistent"]["scope"], "full"
+        )
+        # The stale carried issue from the failed run is gone after recovery.
+        self.assertEqual(
+            [i for i in recovered.issues
+             if i.rule_id == "employment_dates_consistent"],
+            [i for i in full.issues
+             if i.rule_id == "employment_dates_consistent"],
+        )
+
+    def test_no_change_after_failure_is_not_a_pass(self):
+        # A no-op incremental run on top of a failed run must not inherit
+        # "everything is fine" from the stale kept conclusions.
+        clean = load_batch(SAMPLES / "clean.json")
+        first = evaluate(clean, self.rules)
+        self.assertEqual(first.status, "PASSED")
+        # A data edit makes the (broken) date rule actually run and fail.
+        data = [dict(r.data) for r in clean.records]
+        data[0]["leave_date"] = "2024-11-30"
+        path = Path(tempfile.mkdtemp()) / "clean2.json"
+        path.write_text(json.dumps(data))
+        clean2 = load_batch(path, batch_id=clean.batch_id)
+        rules_broken = self.rules[:2] + (self._broken_date_rule(),)
+        failed = incremental_evaluate(first, clean, clean2, rules_broken)
+        self.assertEqual(failed.status, "FAILED")
+        self.assertEqual(failed.incomplete_rules,
+                         ("employment_dates_consistent",))
+        # No further data change: the recovery run must still re-check the
+        # previously failed rule instead of inheriting a stale pass/fail.
+        recovered = incremental_evaluate(failed, clean2, clean2, self.rules)
+        # Only now, after the rule actually ran, may the run pass.
+        self.assertEqual(recovered.status, "PASSED")
+        self.assertIn("employment_dates_consistent", recovered.completed_rules)
 
 
 class LifecycleTests(unittest.TestCase):
@@ -235,6 +419,42 @@ class LifecycleTests(unittest.TestCase):
              "hire_date,leave_date", "violated"),
             still_open,
         )
+
+
+    def test_recovery_resolves_once_without_double_counting(self):
+        first = evaluate(self.batch_v1, self.rules)
+        self.tracker.update(first)
+        broken = type(self.rules[2])(
+            rule_id=self.rules[2].rule_id,
+            rule_type=self.rules[2].rule_type,
+            version_set=self.rules[2].version_set,
+            fields=self.rules[2].fields,
+            params={},
+            depends_on=(),
+        )
+        rules_broken = self.rules[:2] + (broken,)
+        failed = incremental_evaluate(
+            first, self.batch_v1, self.batch_v2, rules_broken
+        )
+        self.tracker.update(failed)
+        # Recovery: the date rule runs again and E002's fix is real now.
+        recovered = incremental_evaluate(
+            failed, self.batch_v2, self.batch_v2, self.rules
+        )
+        transitions = self.tracker.update(recovered)
+        key = ("employment_dates_consistent", "E002",
+               "hire_date,leave_date", "violated")
+        self.assertIn(key, transitions["resolved"])
+        # A further no-change run must not resolve (or open) it again.
+        again = incremental_evaluate(
+            recovered, self.batch_v2, self.batch_v2, self.rules
+        )
+        transitions2 = self.tracker.update(again)
+        self.assertEqual(transitions2["resolved"], [])
+        self.assertEqual(transitions2["opened"], [])
+        kinds = [e["event"] for e in self.tracker.events()
+                 if tuple(e["key"]) == key]
+        self.assertEqual(kinds, ["opened", "resolved"])
 
 
 if __name__ == "__main__":

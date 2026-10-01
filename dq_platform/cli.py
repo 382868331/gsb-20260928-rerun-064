@@ -4,7 +4,7 @@ import argparse
 import sys
 
 from .engine import evaluate
-from .incremental import incremental_evaluate
+from .incremental import describe_plan, incremental_evaluate
 from .lifecycle import IssueTracker
 from .loader import load_batch, load_rule_set
 from .store import ResultStore
@@ -43,6 +43,10 @@ def main(argv=None):
                 break
         result = incremental_evaluate(prev_result, prev_batch, batch, rules)
         print(f"incremental run against batch={prev_batch.batch_id}")
+        if result.plan:
+            print("check plan vs previous run:")
+            for line in describe_plan(_plans_from_result(result), prev_result):
+                print(line)
     else:
         result = evaluate(batch, rules)
     store.append(result)
@@ -77,6 +81,20 @@ def main(argv=None):
     return 1
 
 
+def _plans_from_result(result):
+    from .incremental import RulePlan
+
+    return tuple(
+        RulePlan(
+            rule_id=entry["rule_id"],
+            scope=entry["scope"],
+            targets=tuple(entry.get("targets", ())),
+            reasons=tuple(entry.get("reasons", ())),
+        )
+        for entry in result.plan
+    )
+
+
 def _result_from_dict(doc):
     from .models import Issue, RunResult
 
@@ -92,6 +110,7 @@ def _result_from_dict(doc):
         errors=tuple(doc["errors"]),
         completed_rules=tuple(doc.get("completed_rules", ())),
         incomplete_rules=tuple(doc.get("incomplete_rules", ())),
+        plan=tuple(doc.get("plan", ())),
     )
 
 

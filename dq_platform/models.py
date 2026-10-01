@@ -86,6 +86,9 @@ class RunResult:
     # is kept and the run must not be treated as covering that scope.
     completed_rules: tuple = ()
     incomplete_rules: tuple = ()
+    # Incremental check plan: one dict per rule with scope/targets/reasons,
+    # so the executed scope can be audited against the previous run.
+    plan: tuple = ()
 
     def to_dict(self):
         d = asdict(self)
