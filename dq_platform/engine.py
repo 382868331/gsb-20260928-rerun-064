@@ -57,6 +57,25 @@ def _cell(record, field_name):
     return value
 
 
+def rule_key_fields(rule):
+    """Identity fields a unique_fields rule groups records by."""
+
+    return tuple(rule.params.get("key_fields") or rule.fields)
+
+
+def identity_key(rule, record):
+    """Return the join key for a unique_fields rule.
+
+    Returns None when any identity piece is missing or malformed: such
+    rows never share a duplicate bucket.
+    """
+
+    values = [_cell(record, name) for name in rule_key_fields(rule)]
+    if any(value is MISSING or value is MALFORMED for value in values):
+        return None
+    return tuple(values)
+
+
 def _parse_date(rule, record, field_name):
     value = _cell(record, field_name)
     if value is MISSING:
@@ -108,7 +127,7 @@ def _check_required_fields(rule, records):
 
 
 def _check_unique_fields(rule, records):
-    key_fields = rule.params.get("key_fields") or list(rule.fields)
+    key_fields = rule_key_fields(rule)
     if not key_fields:
         raise ValueError(f"rule {rule.rule_id!r} needs key_fields")
     groups = {}

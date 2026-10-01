@@ -65,6 +65,31 @@ class Issue:
 
 
 @dataclass(frozen=True)
+class RulePlan:
+    """Before/after view of what one rule will re-check this run.
+
+    scope is one of:
+      "full"    - every record group of the rule is re-judged
+      "groups"  - only the named identity groups (unique_fields)
+      "records" - only the listed records (row-level rules)
+      "skip"    - nothing changed that this rule can observe
+    """
+
+    rule_id: str
+    rule_type: str
+    scope: str
+    reason: str
+    affected_record_ids: tuple = ()
+    affected_groups: tuple = ()
+    changed_record_ids: tuple = ()
+    added_record_ids: tuple = ()
+    removed_record_ids: tuple = ()
+
+    def to_dict(self):
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class RunResult:
     """Conclusion for one batch x one immutable rule version set.
 
@@ -81,6 +106,10 @@ class RunResult:
     status: str  # PASSED | FAILED
     issues: tuple
     errors: tuple
+    # Per-rule check plan: which records/groups each rule re-judged and
+    # why; previous_check_plan is the plan of the run being built upon.
+    check_plan: tuple = ()
+    previous_check_plan: tuple = ()
     # Rules whose evaluation finished this run. A rule listed in
     # incomplete_rules failed mid-run: its previous conclusion (if any)
     # is kept and the run must not be treated as covering that scope.

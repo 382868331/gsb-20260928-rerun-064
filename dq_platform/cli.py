@@ -4,7 +4,7 @@ import argparse
 import sys
 
 from .engine import evaluate
-from .incremental import incremental_evaluate
+from .incremental import compare_plans, incremental_evaluate
 from .lifecycle import IssueTracker
 from .loader import load_batch, load_rule_set
 from .store import ResultStore
@@ -46,6 +46,30 @@ def main(argv=None):
     else:
         result = evaluate(batch, rules)
     store.append(result)
+
+    if result.check_plan:
+        report = compare_plans(result.previous_check_plan, result.check_plan)
+        for plan in result.check_plan:
+            if plan.scope == "full":
+                scope_text = "all records (full re-check)"
+            elif plan.scope == "groups":
+                groups = (
+                    " | ".join(",".join(map(str, group))
+                               for group in plan.affected_groups)
+                    or "invalid-identity records"
+                )
+                scope_text = (
+                    f"records {list(plan.affected_record_ids)} in groups "
+                    f"[{groups}]"
+                )
+            elif plan.scope == "records":
+                scope_text = f"records {list(plan.affected_record_ids)}"
+            else:
+                scope_text = "nothing (skipped)"
+            print(
+                f"  [plan] rule={plan.rule_id} scope={plan.scope} "
+                f"reason={plan.reason} covers {scope_text}"
+            )
 
     print(f"batch={result.batch_id} rules={version_set} status={result.status}")
     for issue in result.issues:

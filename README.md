@@ -38,13 +38,23 @@ python -m dq_platform.cli --sample samples/clean.json --rules samples/rules_v1.j
 python -m dq_platform.cli --sample samples/employees_v2.json --batch-id employees_v1 --prev-sample samples/employees_v1.json --rules samples/rules_v1.json --out results --lifecycle
 ```
 
-- 行级规则（`required_fields`、`date_order`）只重判改动/新增的记录；
-  跨记录规则（`unique_fields`）因分组可能整体变化而全量重判该规则；
-  依赖被全量重判的规则会级联全量。未触及的规则直接沿用上次结论。
-- 规则版本集变化（判断条件改变）时自动回退为完整重算。
-- 规则执行中途失败：该规则保留上一份有效结论，运行结果的
-  `incomplete_rules` 与错误信息明确列出本次没有完成的范围，状态仍为
-  FAILED，绝不会报“全部合格”。
+- 检查范围严格对应变化内容，绝不把全量执行改贴增量标签：行级规则
+  （`required_fields`、`date_order`）只重判“该规则实际读取的字段”
+  发生变化的记录及新增记录，只改日期时身份类规则直接跳过；
+  跨记录规则（`unique_fields`）只重判真正受影响的身份组——身份被修改
+  记录的旧组与新组、新增记录加入的组、删除记录原来所在的组，组内每条
+  记录都重判以保证跨行冲突不漏，无关分组沿用上次结论；
+  依赖失效只级联到被依赖规则覆盖到的记录/分组，未触及的规则直接沿用
+  上次结论。
+- 每次运行输出检查计划前后对照（结果中的 `check_plan`，CLI 打印
+  `[plan]` 行）：每条规则标明新增、删除、字段修改或规则定义变化分别
+  影响哪些记录组，范围为 `full` / `groups` / `records` / `skip` 并附原因。
+- 规则定义变化（新增、删除、判断字段/参数/依赖改变）时该规则回退为
+  完整重算；规则版本集变化时整体回退为完整重算。
+- 规则执行中途失败：该规则保留上一份有效结论，`incomplete_rules` 与
+  错误信息明确列出本次没有完成的记录/分组；无关规则继续完成，状态仍
+  为 FAILED，绝不会报“全部合格”。恢复后只把上次未完成的范围重判一次：
+  已解决的问题不会重复计入，旧失败也不会被当作本轮通过。
 
 ## 问题生命周期
 
