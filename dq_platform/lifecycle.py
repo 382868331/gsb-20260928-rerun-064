@@ -75,9 +75,20 @@ class IssueTracker:
         current = result.to_dict()
         completed = set(current.get("completed_rules") or ())
         incomplete = set(current.get("incomplete_rules") or ())
+        blocked_records = {}
+        covered_records = {}
+        for conclusion in current.get("conclusions") or ():
+            rule_id = conclusion["rule_id"]
+            target = (blocked_records if conclusion.get("status") == "blocked"
+                      else covered_records)
+            target.setdefault(rule_id, set()).update(
+                conclusion.get("records", ())
+            )
         present = {}
         for issue in current["issues"]:
-            if issue["rule_id"] in completed:
+            rule_id = issue["rule_id"]
+            if (rule_id in completed
+                    or issue["record_id"] in covered_records.get(rule_id, set())):
                 present[issue_key(issue)] = issue
 
         state = self.state()
@@ -102,12 +113,15 @@ class IssueTracker:
 
         for key in sorted(open_keys - set(present)):
             rule_id = state[key]["issue"]["rule_id"]
-            if rule_id in incomplete:
+            record_id = key[1]
+            if record_id in blocked_records.get(rule_id, set()):
                 # Execution failed: previous conclusion stays valid and the
                 # issue is explicitly NOT judged by this run.
                 transitions["unknown"].append(key)
                 continue
-            if rule_id not in completed:
+            if rule_id not in completed and record_id not in covered_records.get(
+                rule_id, set()
+            ):
                 continue
             new_events.append(self._event(
                 RESOLVED, key, state[key]["issue"], result,

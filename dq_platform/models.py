@@ -59,6 +59,7 @@ class Issue:
     field: str
     kind: str  # violated | missing_value | malformed_value
     detail: str
+    basis_versions: dict = field(default_factory=dict)
 
     def to_dict(self):
         return asdict(self)
@@ -89,6 +90,10 @@ class RunResult:
     # Incremental check plan: one dict per rule with scope/targets/reasons,
     # so the executed scope can be audited against the previous run.
     plan: tuple = ()
+    # Versioned rule conclusions. Each unit is one record (row rules) or
+    # one dependency group (cross-record rules), and records the upstream
+    # conclusion versions actually used.
+    conclusions: tuple = ()
 
     def to_dict(self):
         d = asdict(self)

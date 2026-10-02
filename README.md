@@ -20,6 +20,9 @@ python -m dq_platform.cli --sample samples/clean.json --rules samples/rules_v1.j
 - `unique_fields`：跨记录身份唯一（默认按 `fields`，可用 `params.key_fields`）。
 - `date_order`：跨字段日期先后，如 `hire_date <= leave_date`；无法解析记为
   `malformed_value`。
+- `grouped_sum`：按字段分组后校验金额合计，可配置 `group_fields`、
+  `amount_field`、`min_total` 与 `max_total`。该规则依赖身份类上游，
+  只有依赖范围内的分组结论已经在本轮确认后才会计算，绝不拿旧分组冒充通过。
 
 缺失值（`MISSING`）与格式错误（`MALFORMED`）是独立哨兵，参与比较会抛
 `TypeError`，绝不被当作 0/空串参与判断。
@@ -92,3 +95,34 @@ python -m unittest discover -s tests -v
 第三轮新增：按变化内容限定检查范围（身份唯一性按受影响身份组重判而非
 全量）、检查计划前后对照与逐条理由、失败恢复后全量重判且已解决问题不
 重复计入，均有测试覆盖。
+
+## 依赖版本与影响预览（第四轮）
+
+每个规则结论按“记录单元”或“分组单元”保存版本：
+
+- 行级规则的单元是单条记录；跨记录规则的单元是一个身份/业务分组。
+- 每个下游单元在 `conclusions[].basis_versions` 中记录实际采用的上游
+  规则、单元版本和覆盖记录；`status=blocked` 表示该单元本轮不能重新确认。
+- 上游执行失败或上游依据缺失时，依赖链上的受影响记录/分组会标记为
+  `blocked`，错误信息列出不能确认的范围；无关规则和无关分组照常完成。
+- 下游分组规则会使用已确认上游单元计算；blocked 单元中的旧问题只作为历史
+  证据保留，不会让本轮结果标为通过，也不会被误记为解决。
+
+修改规则或字段前可以预览影响：
+
+```bash
+python -m dq_platform.cli \
+  --sample samples/department_amounts.json \
+  --rules samples/rules_dependent_sum.json \
+  --out results \
+  --preview-rule department_identity_present
+```
+
+预览沿 `depends_on` 反向传播，输出每个受影响规则、范围、去重后的记录集合
+和依赖路径；多个上游或多条依赖路径指向同一规则/范围时只计一次。配合
+`--prev-sample` 会读取上一轮结果，并显示该范围内下游当前实际引用的上游
+结论版本。依赖成环由 `topo_order` 抛错并使运行 FAILED；缺少依赖或缺少可
+追溯依据会分别在错误或 `warnings` / `missing_basis` 中明确反馈。
+
+身份拆分后重新合并、上游中断、恢复后继续核对以及无关规则正常完成的完整
+过程见 `tests/test_dependency_versions.py`。

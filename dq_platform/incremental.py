@@ -23,12 +23,24 @@ did not cover; unrelated rules still finish normally.
 
 from dataclasses import dataclass
 
-from .engine import CHECKS, DependencyError, _cell, evaluate, topo_order
+from .engine import (
+    CHECKS,
+    CROSS_RECORD_TYPES as ENGINE_CROSS_RECORD_TYPES,
+    DependencyError,
+    _attach_basis,
+    _blocked_record_ids,
+    build_conclusions,
+    _cell,
+    evaluate,
+    rule_group_fields,
+    topo_order,
+    _unit_records,
+)
 from .models import RunResult, utc_now
 from .values import is_bad
 
 # Rule types whose verdicts span records; scoped by identity group.
-CROSS_RECORD_TYPES = {"unique_fields"}
+CROSS_RECORD_TYPES = ENGINE_CROSS_RECORD_TYPES
 
 _ABSENT = object()
 
@@ -48,6 +60,7 @@ class RulePlan:
     targets: tuple = ()
     replaces: tuple = ()
     reasons: tuple = ()
+    blocked_targets: tuple = ()
 
 
 def diff_batches(old_batch, new_batch):
@@ -122,7 +135,7 @@ def _definition_changed(rule, prev_rules):
 
 
 def build_plan(rules, old_batch, new_batch, prev_rules=None,
-               prev_incomplete=()):
+               prev_incomplete=(), prev_conclusions=()):
     """Plan each rule's re-check scope for the old->new batch diff.
 
     Returns RulePlan entries in dependency order.  Every plan names the
@@ -135,6 +148,9 @@ def build_plan(rules, old_batch, new_batch, prev_rules=None,
     old_by_id = {r.record_id: r for r in old_batch.records}
     new_by_id = {r.record_id: r for r in new_batch.records}
     prev_incomplete = set(prev_incomplete)
+    prior_units = {}
+    for conclusion in prev_conclusions or ():
+        prior_units.setdefault(conclusion["rule_id"], []).append(conclusion)
 
     plans = {}
     for rule in ordered:
@@ -166,6 +182,7 @@ def build_plan(rules, old_batch, new_batch, prev_rules=None,
 
         dep_targets = []
         dep_full = False
+        upstream_blocked = set()
         for dep in rule.depends_on:
             dplan = plans[dep]
             if dplan.scope == "full":
@@ -176,6 +193,19 @@ def build_plan(rules, old_batch, new_batch, prev_rules=None,
                     f"dependency {dep!r} re-judged: "
                     + ", ".join(dplan.targets)
                 )
+            if dplan.blocked_targets:
+                upstream_blocked.update(dplan.blocked_targets)
+            elif dplan.scope == "skip":
+                upstream_blocked.update(
+                    rid for unit in prior_units.get(dep, ())
+                    if unit.get("status") == "blocked"
+                    for rid in unit.get("records", ())
+                )
+        if upstream_blocked:
+            reasons.append(
+                "dependency basis unavailable for records: "
+                + ", ".join(sorted(upstream_blocked & set(new_by_id)))
+            )
 
         touched = tuple(dict.fromkeys((*modified, *added, *dep_targets)))
 
@@ -210,13 +240,20 @@ def build_plan(rules, old_batch, new_batch, prev_rules=None,
 
         if rule.rule_type in CROSS_RECORD_TYPES:
             if not touched and not removed:
-                plans[rule.rule_id] = RulePlan(
-                    rule.rule_id, "skip",
-                    reasons=("no identity-relevant change",),
-                )
+                blocked = tuple(upstream_blocked & set(new_by_id))
+                if blocked:
+                    plans[rule.rule_id] = RulePlan(
+                        rule.rule_id, "records", targets=blocked,
+                        replaces=(), blocked_targets=blocked,
+                        reasons=tuple(reasons),
+                    )
+                else:
+                    plans[rule.rule_id] = RulePlan(
+                        rule.rule_id, "skip",
+                        reasons=("no identity-relevant change",),
+                    )
                 continue
-            key_fields = (rule.params.get("key_fields")
-                          or list(rule.fields))
+            key_fields = rule_group_fields(rule)
             if not key_fields:
                 plans[rule.rule_id] = RulePlan(
                     rule.rule_id, "full",
@@ -247,6 +284,9 @@ def build_plan(rules, old_batch, new_batch, prev_rules=None,
             )
             plans[rule.rule_id] = RulePlan(
                 rule.rule_id, "groups", targets=targets, replaces=replaces,
+                blocked_targets=tuple(
+                    rid for rid in targets if rid in upstream_blocked
+                ),
                 reasons=tuple(reasons) + (
                     f"affected identity groups: {len(affected_keys)} "
                     f"covering {len(targets)} record(s)",
@@ -264,20 +304,26 @@ def build_plan(rules, old_batch, new_batch, prev_rules=None,
             continue
         targets = tuple(rid for rid in touched if rid in new_by_id)
         plans[rule.rule_id] = RulePlan(
-            rule.rule_id, "records", targets=targets, replaces=targets,
+            rule.rule_id, "records", targets=targets, replaces=tuple(
+                rid for rid in targets if rid not in upstream_blocked
+            ),
+            blocked_targets=tuple(
+                rid for rid in targets if rid in upstream_blocked
+            ),
             reasons=tuple(reasons),
         )
     return tuple(plans[rule.rule_id] for rule in ordered)
 
 
 def plan_scopes(rules, old_batch, new_batch, prev_rules=None,
-                prev_incomplete=()):
+                prev_incomplete=(), prev_conclusions=()):
     """Map each rule id to "full", "records", "groups" or "skip"."""
     return {
         plan.rule_id: plan.scope
         for plan in build_plan(
             rules, old_batch, new_batch,
             prev_rules=prev_rules, prev_incomplete=prev_incomplete,
+            prev_conclusions=prev_conclusions,
         )
     }
 
@@ -313,6 +359,218 @@ def describe_plan(plans, prev_result=None):
     return lines
 
 
+def _all_record_ids(batch):
+    if batch is None:
+        return ()
+    return tuple(record.record_id for record in batch.records)
+
+
+def _expand_by_rule_groups(rule, record_ids, batch):
+    fields = rule_group_fields(rule)
+    ids = set(record_ids)
+    if not fields:
+        return ids
+    by_id = {record.record_id: record for record in batch.records}
+    affected_keys = {
+        tuple(_cell(by_id[rid], name) for name in fields)
+        for rid in record_ids if rid in by_id
+    }
+    affected_keys.discard(None)
+    for record in batch.records:
+        key = tuple(_cell(record, name) for name in fields)
+        if key in affected_keys:
+            ids.add(record.record_id)
+    return ids
+
+
+def dependency_impact(rules, changed_rules=(), changed_records=(),
+                      changed_fields=None, batch=None, old_batch=None,
+                      prev_result=None):
+    """Preview checks affected by rule and/or record-field modifications.
+
+    ``changed_records`` maps a root record id to its changed fields.  A rule
+    listed in ``changed_rules`` is treated as a rule-definition change and may
+    affect every record. Reverse dependencies are traversed transitively;
+    each downstream rule appears once, even if several paths or upstreams
+    point at the same affected range.
+    """
+    ordered = topo_order(rules)
+    by_id = {rule.rule_id: rule for rule in ordered}
+    reverse = {rule.rule_id: [] for rule in ordered}
+    for rule in ordered:
+        for dep in rule.depends_on:
+            reverse[dep].append(rule.rule_id)
+
+    preview_batch = batch or old_batch
+    all_ids = _all_record_ids(preview_batch)
+    changed_records = dict(changed_records or {})
+    changed_fields = changed_fields or {}
+    if isinstance(changed_fields, (list, tuple, set)):
+        shared_fields = set(changed_fields)
+        changed_fields = {rid: shared_fields for rid in changed_records}
+
+    affected = {}
+    roots = []
+    for rule_id in dict.fromkeys(changed_rules):
+        rule = by_id[rule_id]
+        target_ids = set(all_ids) if preview_batch is not None else {"*"}
+        affected[rule_id] = {
+            "rule_id": rule_id,
+            "scope": "full",
+            "target_ids": target_ids,
+            "paths": [(rule_id,)],
+            "reasons": ["rule definition is proposed to change"],
+            "definition_changed": True,
+        }
+        roots.append(rule_id)
+
+    for record_id, fields in changed_fields.items():
+        for rule in ordered:
+            relevant = _rule_fields(rule)
+            if relevant is None or relevant & set(fields):
+                entry = affected.setdefault(rule.rule_id, {
+                    "rule_id": rule.rule_id,
+                    "scope": "records",
+                    "target_ids": set(),
+                    "paths": [(rule.rule_id,)],
+                    "reasons": [],
+                    "definition_changed": False,
+                })
+                expanded = {record_id}
+                if rule.rule_type in CROSS_RECORD_TYPES:
+                    expanded = _expand_by_rule_groups(
+                        rule, [record_id], preview_batch
+                    )
+                    if old_batch is not None and batch is not old_batch:
+                        expanded |= _expand_by_rule_groups(
+                            rule, [record_id], old_batch
+                        )
+                entry["target_ids"].update(expanded)
+                entry["reasons"].append(
+                    f"record {record_id} fields changed: "
+                    + ",".join(sorted(fields))
+                )
+                roots.append(rule.rule_id)
+
+    pending = list(dict.fromkeys(roots))
+    while pending:
+        parent = pending.pop(0)
+        parent_entry = affected[parent]
+        for child_id in reverse.get(parent, ()):
+            child = by_id[child_id]
+            if preview_batch is None or "*" in parent_entry["target_ids"]:
+                target_ids = {"*"}
+                scope = "full"
+            elif parent_entry.get("definition_changed"):
+                target_ids = (
+                    set(all_ids) if preview_batch is not None else {"*"}
+                )
+                scope = "full"
+            else:
+                target_ids = _expand_by_rule_groups(
+                    child, parent_entry["target_ids"], preview_batch
+                )
+                scope = "full" if target_ids == set(all_ids) else "records"
+            new_paths = [
+                path + (child_id,)
+                for path in parent_entry["paths"]
+            ]
+            if child_id in affected:
+                before = len(affected[child_id]["target_ids"])
+                affected[child_id]["target_ids"].update(target_ids)
+                is_full = (
+                    scope == "full"
+                    or "*" in target_ids
+                    or affected[child_id]["scope"] == "full"
+                )
+                affected[child_id]["scope"] = "full" if is_full else "records"
+                affected[child_id]["paths"].extend(new_paths)
+                grew = len(affected[child_id]["target_ids"]) > before
+            else:
+                affected[child_id] = {
+                    "rule_id": child_id,
+                    "scope": scope,
+                    "target_ids": target_ids,
+                    "paths": new_paths,
+                    "reasons": [f"affected through dependency {parent!r}"],
+                    "definition_changed": False,
+                }
+                grew = True
+            if grew:
+                pending.append(child_id)
+
+    previous_versions = {}
+    blocked = {}
+    missing = {}
+    if prev_result is not None:
+        for conclusion in prev_result.conclusions:
+            rule_id = conclusion["rule_id"]
+            previous_versions.setdefault(rule_id, []).append(conclusion)
+            if conclusion.get("status") == "blocked":
+                blocked.setdefault(rule_id, set()).update(
+                    conclusion.get("records", ())
+                )
+            for dep in conclusion.get("missing_basis", ()):
+                missing.setdefault(rule_id, set()).add(dep)
+
+    result = []
+    warnings = []
+    for rule in ordered:
+        if rule.rule_id not in affected:
+            continue
+        entry = affected[rule.rule_id]
+        target_ids = entry["target_ids"]
+        blocked_targets = sorted(target_ids & blocked.get(rule.rule_id, set()))
+        if blocked_targets:
+            warnings.append(
+                f"rule {rule.rule_id!r} has stale/blocked records: "
+                + ",".join(blocked_targets)
+            )
+        for dep in sorted(missing.get(rule.rule_id, ())):
+            warnings.append(
+                f"rule {rule.rule_id!r} lacks current basis from {dep!r}"
+            )
+        path_text = [" -> ".join(path) for path in dict.fromkeys(
+            map(tuple, entry["paths"])
+        )]
+        result.append({
+            "rule_id": rule.rule_id,
+            "scope": entry["scope"],
+            "affected_count": len(target_ids),
+            "target_ids": tuple(sorted(target_ids)),
+            "blocked_target_ids": tuple(blocked_targets),
+            "paths": tuple(path_text),
+            "reasons": tuple(dict.fromkeys(entry["reasons"])),
+            "current_basis": trace_basis_versions(
+                prev_result, rule.rule_id, target_ids
+            ) if prev_result is not None else {},
+        })
+    return {"affected": tuple(result), "warnings": tuple(warnings)}
+
+
+def trace_basis_versions(result, rule_id, record_ids=None):
+    """Return the upstream versions actually used by one conclusion."""
+    wanted = set(record_ids or ())
+    trace = {}
+    for conclusion in result.conclusions:
+        if conclusion["rule_id"] != rule_id:
+            continue
+        records = conclusion.get("records", ())
+        if wanted and not wanted.intersection(records):
+            continue
+        trace[conclusion["version"]] = {
+            "unit": conclusion.get("unit"),
+            "status": conclusion.get("status"),
+            "records": tuple(records),
+            "basis_versions": dict(conclusion.get("basis_versions", {})),
+            "missing_basis": tuple(conclusion.get("missing_basis", ())),
+        }
+    return trace
+
+
+preview_dependency_impact = dependency_impact
+
+
 def incremental_evaluate(prev_result, old_batch, new_batch, rules,
                          prev_rules=None):
     """Re-check new_batch against rules, reusing prev_result where safe.
@@ -333,6 +591,7 @@ def incremental_evaluate(prev_result, old_batch, new_batch, rules,
             rules, old_batch, new_batch,
             prev_rules=prev_rules,
             prev_incomplete=prev_result.incomplete_rules,
+            prev_conclusions=prev_result.conclusions,
         )
     except DependencyError as exc:
         finished = utc_now()
@@ -349,10 +608,6 @@ def incremental_evaluate(prev_result, old_batch, new_batch, rules,
             incomplete_rules=tuple(rule.rule_id for rule in rules),
         )
 
-    prev_by_rule = {}
-    for issue in prev_result.issues:
-        prev_by_rule.setdefault(issue.rule_id, []).append(issue)
-
     # Carried conclusions: drop records that no longer exist and rules that
     # no longer exist; everything else starts from the previous verdict.
     current_rule_ids = {rule.rule_id for rule in rules}
@@ -361,56 +616,174 @@ def incremental_evaluate(prev_result, old_batch, new_batch, rules,
         if issue.record_id not in removed_ids
         and issue.rule_id in current_rule_ids
     ]
+    carried_conclusions = [
+        dict(conclusion,
+             records=[rid for rid in conclusion.get("records", ())
+                      if rid not in removed_ids])
+        for conclusion in prev_result.conclusions
+        if conclusion.get("rule_id") in current_rule_ids
+        and any(rid not in removed_ids
+                for rid in conclusion.get("records", ()))
+    ]
     errors = []
     completed = []
     incomplete = []
     new_records = {r.record_id: r for r in new_batch.records}
+    run_id = f"{new_batch.batch_id}:{version_set}:{started}"
+
+    def current_conclusions():
+        grouped = {}
+        for conclusion in carried_conclusions:
+            grouped.setdefault(conclusion["rule_id"], []).append(conclusion)
+        return grouped
+
+    def remove_conclusions(rule_id, record_ids):
+        nonlocal carried_conclusions
+        record_ids = set(record_ids)
+        carried_conclusions = [
+            conclusion for conclusion in carried_conclusions
+            if not (conclusion["rule_id"] == rule_id
+                    and record_ids.intersection(conclusion.get("records", ())))
+        ]
+
+    def block_conclusions(rule_id, record_ids, missing=()):
+        record_ids = set(record_ids)
+        for conclusion in carried_conclusions:
+            if (conclusion["rule_id"] == rule_id
+                    and record_ids.intersection(conclusion.get("records", ()))):
+                conclusion["status"] = "blocked"
+                conclusion["scope"] = "stale"
+                conclusion.setdefault("missing_basis", [])
+                for dep in missing:
+                    if dep not in conclusion["missing_basis"]:
+                        conclusion["missing_basis"].append(dep)
+
+    def replace_blocked_conclusions(rule, record_ids, forced_ids=None):
+        record_ids = set(record_ids)
+        forced_ids = set(record_ids if forced_ids is None else forced_ids)
+        if not record_ids:
+            return
+        remove_conclusions(rule.rule_id, record_ids)
+        blocked_records = tuple(
+            new_records[rid] for rid in record_ids if rid in new_records
+        )
+        carried_conclusions.extend(build_conclusions(
+            run_id, rule, blocked_records, merged, current_conclusions(),
+            "blocked", scope="blocked",
+            forced_records=forced_ids, force_units=True,
+        ))
+
+    def dependent_blocked_ids(rule, target_ids):
+        blocked = _blocked_record_ids(rule, current_conclusions())
+        blocked.update(
+            issue.record_id for issue in merged
+            if issue.rule_id in set(rule.depends_on)
+        )
+        fields = rule_group_fields(rule)
+        if not fields or not blocked:
+            return blocked & set(target_ids)
+        if blocked.intersection(target_ids):
+            return set(target_ids)
+        blocked_keys = {
+            tuple(_cell(new_records[rid], name) for name in fields)
+            for rid in blocked if rid in new_records
+        }
+        return {
+            rid for rid in target_ids
+            if tuple(_cell(new_records[rid], name) for name in fields)
+            in blocked_keys
+        }
 
     for plan in plans:
         rule = next(r for r in rules if r.rule_id == plan.rule_id)
         if plan.scope == "skip":
-            completed.append(rule.rule_id)
+            if plan.blocked_targets:
+                replace_blocked_conclusions(
+                    rule, plan.blocked_targets,
+                    set(plan.targets) or set(plan.blocked_targets)
+                )
+                incomplete.append(rule.rule_id)
+                errors.append(
+                    f"rule {rule.rule_id!r} cannot reconfirm records "
+                    f"{','.join(plan.blocked_targets)}: dependency basis is "
+                    "unavailable; carried conclusion is not this run's verdict"
+                )
+            else:
+                completed.append(rule.rule_id)
             continue
         if plan.scope == "full":
             targets = [r.record_id for r in new_batch.records]
-            replaced_ids = {
-                i.record_id for i in prev_by_rule.get(rule.rule_id, [])
-            } - removed_ids
+            replaced_ids = set(targets)
         else:
             targets = [rid for rid in plan.targets if rid in new_records]
-            replaced_ids = set(plan.replaces) - removed_ids
-        replaced = [i for i in prev_by_rule.get(rule.rule_id, [])
-                    if i.record_id in replaced_ids]
-        merged = [i for i in merged if i not in replaced]
-        relevant = tuple(
-            new_records[rid] for rid in targets
-            if not any(
-                i.record_id == rid and i.rule_id in rule.depends_on
-                for i in merged
+            replaced_ids = (
+                set(plan.replaces) | set(targets) | set(plan.blocked_targets)
+            ) - removed_ids
+        issue_replaced_ids = set(replaced_ids)
+        blocked = dependent_blocked_ids(rule, targets)
+        executed_ids = [rid for rid in targets if rid not in blocked]
+        if blocked:
+            record_ids = set(targets)
+            blocked_records = tuple(
+                new_records[rid] for rid in record_ids if rid in new_records
             )
-        )
+            remove_conclusions(rule.rule_id, record_ids)
+            carried_conclusions.extend(build_conclusions(
+                run_id, rule, blocked_records, merged,
+                current_conclusions(), "blocked", scope="blocked",
+                forced_records=record_ids, force_units=True,
+            ))
+            issue_replaced_ids -= blocked
+            errors.append(
+                f"rule {rule.rule_id!r} cannot reconfirm records "
+                f"{','.join(sorted(blocked))}: upstream basis is unavailable"
+            )
         handler = CHECKS.get(rule.rule_type)
         try:
             if handler is None:
                 raise ValueError(f"unknown rule type {rule.rule_type!r}")
-            produced = handler(rule, relevant)
+            produced = handler(
+                rule, tuple(new_records[rid] for rid in executed_ids)
+            )
         except Exception as exc:
             # Keep the previous valid conclusion for this rule and say
             # plainly which scope this run failed to cover.
-            merged.extend(replaced)
+            replace_blocked_conclusions(rule, executed_ids)
             incomplete.append(rule.rule_id)
             if plan.scope == "full":
                 covered = "all records"
             else:
-                covered = "records: " + ",".join(sorted(targets))
+                covered = "records: " + ",".join(sorted(executed_ids))
             errors.append(
                 f"rule {rule.rule_id!r} failed during incremental run: {exc}; "
                 f"kept previous conclusion; scope NOT completed this run: "
                 f"{covered}"
             )
             continue
+        merged = [
+            issue for issue in merged
+            if not (issue.rule_id == rule.rule_id
+                    and issue.record_id in issue_replaced_ids)
+        ]
+        produced = _attach_basis(
+            tuple(merged) + tuple(produced), rule,
+            _unit_records(
+                rule, tuple(new_records[rid] for rid in executed_ids)
+            ),
+            current_conclusions(),
+        )[len(merged):]
+        remove_conclusions(rule.rule_id, set(targets) - set(blocked))
+        carried_conclusions.extend(build_conclusions(
+            run_id, rule,
+            tuple(new_records[rid] for rid in executed_ids),
+            tuple(merged) + tuple(produced),
+            current_conclusions(), "confirmed", scope=plan.scope,
+        ))
         merged.extend(produced)
-        completed.append(rule.rule_id)
+        if blocked:
+            incomplete.append(rule.rule_id)
+        else:
+            completed.append(rule.rule_id)
 
     finished = utc_now()
     status = "FAILED" if merged or errors else "PASSED"
@@ -424,13 +797,15 @@ def incremental_evaluate(prev_result, old_batch, new_batch, rules,
         status=status,
         issues=tuple(merged),
         errors=tuple(errors),
-        completed_rules=tuple(completed),
-        incomplete_rules=tuple(incomplete),
+        completed_rules=tuple(dict.fromkeys(completed)),
+        incomplete_rules=tuple(dict.fromkeys(incomplete)),
+        conclusions=tuple(carried_conclusions),
         plan=tuple(
             {
                 "rule_id": plan.rule_id,
                 "scope": plan.scope,
                 "targets": list(plan.targets),
+                "blocked_targets": list(plan.blocked_targets),
                 "reasons": list(plan.reasons),
             }
             for plan in plans

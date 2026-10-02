@@ -1,0 +1,17 @@
+[
+  {
+    "id": "D1-001",
+    "department": "sales",
+    "amount": 60
+  },
+  {
+    "id": "D1-002",
+    "department": "sales",
+    "amount": 50
+  },
+  {
+    "id": "D1-003",
+    "department": "ops",
+    "amount": 200
+  }
+]

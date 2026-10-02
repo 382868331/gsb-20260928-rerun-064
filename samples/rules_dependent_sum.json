@@ -1,0 +1,26 @@
+{
+  "version_set": "dependent-sum-v1",
+  "rules": [
+    {
+      "id": "department_identity_present",
+      "type": "required_fields",
+      "fields": ["id", "department"]
+    },
+    {
+      "id": "department_identity_unique",
+      "type": "unique_fields",
+      "params": {"key_fields": ["id"]},
+      "depends_on": ["department_identity_present"]
+    },
+    {
+      "id": "department_amount_total",
+      "type": "grouped_sum",
+      "params": {
+        "group_fields": ["department"],
+        "amount_field": "amount",
+        "max_total": 100
+      },
+      "depends_on": ["department_identity_unique"]
+    }
+  ]
+}
