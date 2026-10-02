@@ -77,6 +77,32 @@ python -m dq_platform.cli --sample samples/employees_v2.json --batch-id employee
 - 执行失败的规则：其未结问题标记为 `unknown`，既不被误记为已解决，
   也不会被重复打开。
 
+## 依赖下游与影响预览（第四轮）
+
+新规则类型 `group_sum`：先由上游身份规则确认记录身份，再按确认后的
+分组对数值字段求和并约束总额（`params`: `key_fields` / `sum_field` /
+`max_total` / `min_total`）。身份未确认的记录不参与分组求和；缺失或
+非数值的金额按 `missing_value` / `malformed_value` 报告，绝不按 0 计入。
+
+上游结论未更新或执行失败时，下游按身份组区分范围：
+
+- 与上游未确认范围不重叠的分组仍可复用旧结论并照常重判；
+- 重叠的分组本轮**不能重新确认**：保留旧结论作为历史，规则列入
+  `incomplete_rules`，错误信息列出未确认的记录，运行状态为 FAILED——
+  不会借旧分组把本轮标为通过；
+- 结果 JSON 的 `plan` 中每条规则带 `blocked`（本轮未确认的记录）与
+  `upstream`（每个上游结论实际采用的运行：`carried` 指沿用上轮运行，
+  `current` 指本轮重判），可逐条追到下游结论使用的上游版本。
+
+影响预览（不执行检查，只报告影响面）：
+
+    python -m dq_platform.cli --sample samples/payments_v2.json --prev-sample samples/payments_v1.json --rules samples/rules_deps.json --preview-impact --changed-field txn_ref
+
+沿依赖图向下游传播，同一受影响范围只计一次；依赖成环、依赖缺失或
+指定的规则不存在都会给出明确错误并以退出码 1 结束。恢复运行会对
+未确认范围全量重判，与完整重算结果一致，已解决的问题在生命周期
+账本中只记一次 `resolved`。
+
 ## 测试
 
 ```bash
@@ -92,3 +118,8 @@ python -m unittest discover -s tests -v
 第三轮新增：按变化内容限定检查范围（身份唯一性按受影响身份组重判而非
 全量）、检查计划前后对照与逐条理由、失败恢复后全量重判且已解决问题不
 重复计入，均有测试覆盖。
+
+第四轮新增：`group_sum` 按确认后的身份分组计算总额约束、上游中断时
+下游按组区分可复用与不可重新确认的范围、影响预览与上游版本追溯、
+多上游同时变化时范围去重、身份拆分后重新合并与恢复运行的结果均与
+完整重算一致，均有测试覆盖。

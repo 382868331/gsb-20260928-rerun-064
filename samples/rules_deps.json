@@ -1,0 +1,39 @@
+{
+  "version_set": "rules-2024-deps",
+  "rules": [
+    {
+      "id": "payment_identity",
+      "type": "unique_fields",
+      "params": {
+        "key_fields": [
+          "txn_ref"
+        ]
+      }
+    },
+    {
+      "id": "payment_dates",
+      "type": "date_order",
+      "params": {
+        "early_field": "start_date",
+        "late_field": "end_date",
+        "optional_fields": [
+          "end_date"
+        ]
+      }
+    },
+    {
+      "id": "account_total_cap",
+      "type": "group_sum",
+      "params": {
+        "key_fields": [
+          "account"
+        ],
+        "sum_field": "amount",
+        "max_total": 1000
+      },
+      "depends_on": [
+        "payment_identity"
+      ]
+    }
+  ]
+}

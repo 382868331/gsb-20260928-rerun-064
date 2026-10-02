@@ -180,10 +180,79 @@ def _check_date_order(rule, records):
     return issues
 
 
+def _check_group_sum(rule, records):
+    """Sum a numeric field per confirmed identity group and bound the total.
+
+    Only records that passed the upstream identity rules reach this check
+    (the engine filters records with dependency issues), so totals are
+    computed on confirmed groups only.  Missing/malformed amounts are
+    reported per record and never coerced to zero.
+    """
+    key_fields = rule.params.get("key_fields") or list(rule.fields)
+    sum_field = rule.params.get("sum_field")
+    max_total = rule.params.get("max_total")
+    min_total = rule.params.get("min_total")
+    if not key_fields or not sum_field or (
+        max_total is None and min_total is None
+    ):
+        raise ValueError(
+            f"rule {rule.rule_id!r} needs key_fields, sum_field and "
+            "max_total and/or min_total"
+        )
+    issues = []
+    groups = {}
+    for record in records:
+        values = [_cell(record, name) for name in key_fields]
+        if any(value is MISSING or value is MALFORMED for value in values):
+            for name, value in zip(key_fields, values):
+                if value is MISSING:
+                    issues.append(_issue(
+                        rule, record, name, "missing_value",
+                        f"group identity field {name!r} is missing",
+                    ))
+                elif value is MALFORMED:
+                    issues.append(_issue(
+                        rule, record, name, "malformed_value",
+                        f"group identity field {name!r} is malformed",
+                    ))
+            continue
+        amount = _cell(record, sum_field)
+        if amount is MISSING:
+            issues.append(_issue(
+                rule, record, sum_field, "missing_value",
+                f"sum field {sum_field!r} is missing",
+            ))
+            continue
+        if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+            issues.append(_issue(
+                rule, record, sum_field, "malformed_value",
+                f"sum field {sum_field!r}={amount!r} is not a number",
+            ))
+            continue
+        groups.setdefault(tuple(values), []).append((record, amount))
+    for key, members in groups.items():
+        total = sum(amount for _, amount in members)
+        breached = None
+        if max_total is not None and total > max_total:
+            breached = f"exceeds max_total {max_total}"
+        elif min_total is not None and total < min_total:
+            breached = f"below min_total {min_total}"
+        if breached is None:
+            continue
+        group_desc = dict(zip(key_fields, key))
+        for record, _ in members:
+            issues.append(_issue(
+                rule, record, sum_field, "violated",
+                f"group {group_desc} total {total} {breached}",
+            ))
+    return issues
+
+
 CHECKS = {
     "required_fields": _check_required_fields,
     "unique_fields": _check_unique_fields,
     "date_order": _check_date_order,
+    "group_sum": _check_group_sum,
 }
 
 

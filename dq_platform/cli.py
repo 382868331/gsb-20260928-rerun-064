@@ -4,6 +4,8 @@ import argparse
 import sys
 
 from .engine import evaluate
+from .engine import DependencyError
+from .impact import describe_impact, preview_impact
 from .incremental import describe_plan, incremental_evaluate
 from .lifecycle import IssueTracker
 from .loader import load_batch, load_rule_set
@@ -28,10 +30,44 @@ def main(argv=None):
         "--lifecycle", action="store_true",
         help="update the issue lifecycle ledger (issues.jsonl) in --out",
     )
+    parser.add_argument(
+        "--preview-impact", action="store_true",
+        help="only preview which checks --changed-field/--changed-rule "
+             "would affect along dependencies, then exit",
+    )
+    parser.add_argument(
+        "--changed-field", action="append", default=[],
+        help="field a proposed edit would touch (repeatable)",
+    )
+    parser.add_argument(
+        "--changed-rule", action="append", default=[],
+        help="rule id a proposed revision would touch (repeatable)",
+    )
     args = parser.parse_args(argv)
 
     batch = load_batch(args.sample, batch_id=args.batch_id)
     version_set, rules = load_rule_set(args.rules)
+    if args.preview_impact:
+        old_batch = None
+        if args.prev_sample:
+            old_batch = load_batch(
+                args.prev_sample, batch_id=args.prev_batch_id
+            )
+        try:
+            preview = preview_impact(
+                rules,
+                changed_fields=args.changed_field,
+                changed_rules=args.changed_rule,
+                old_batch=old_batch,
+                new_batch=batch,
+            )
+        except DependencyError as exc:
+            print(f"dependency error: {exc}")
+            return 1
+        print("impact preview:")
+        for line in describe_impact(preview):
+            print(line)
+        return 0
     store = ResultStore(args.out)
     if args.prev_sample:
         prev_batch = load_batch(args.prev_sample, batch_id=args.prev_batch_id)

@@ -1,0 +1,50 @@
+[
+  {
+    "id": "P001",
+    "txn_ref": "T001",
+    "account": "A1",
+    "amount": 600,
+    "start_date": "2024-01-01",
+    "end_date": "2024-02-01"
+  },
+  {
+    "id": "P002",
+    "txn_ref": "T002",
+    "account": "A1",
+    "amount": 300,
+    "start_date": "2024-02-01",
+    "end_date": "2024-03-01"
+  },
+  {
+    "id": "P003",
+    "txn_ref": "T003",
+    "account": "A2",
+    "amount": 300,
+    "start_date": "2024-01-05",
+    "end_date": "2024-02-05"
+  },
+  {
+    "id": "P004",
+    "txn_ref": "T004",
+    "account": "A2",
+    "amount": 400,
+    "start_date": "2024-02-05",
+    "end_date": "2024-03-05"
+  },
+  {
+    "id": "P005",
+    "txn_ref": "T005",
+    "account": "A3",
+    "amount": 100,
+    "start_date": "2024-03-01",
+    "end_date": "2024-04-01"
+  },
+  {
+    "id": "P006",
+    "txn_ref": "T006",
+    "account": "A3",
+    "amount": 200,
+    "start_date": "2024-04-01",
+    "end_date": "2024-05-01"
+  }
+]

@@ -28,7 +28,7 @@ from .models import RunResult, utc_now
 from .values import is_bad
 
 # Rule types whose verdicts span records; scoped by identity group.
-CROSS_RECORD_TYPES = {"unique_fields"}
+CROSS_RECORD_TYPES = {"unique_fields", "group_sum"}
 
 _ABSENT = object()
 
@@ -99,6 +99,12 @@ def _rule_fields(rule):
         if not key_fields:
             return None
         return set(rule.fields) | set(key_fields)
+    if rule.rule_type == "group_sum":
+        key_fields = params.get("key_fields") or list(rule.fields)
+        sum_field = params.get("sum_field")
+        if not key_fields or not sum_field:
+            return None
+        return set(rule.fields) | set(key_fields) | {sum_field}
     return set(rule.fields)
 
 
@@ -282,6 +288,47 @@ def plan_scopes(rules, old_batch, new_batch, prev_rules=None,
     }
 
 
+def _blocked_records(rule, unconfirmed, old_by_id, new_by_id):
+    """Record ids whose verdicts cannot be re-confirmed this run.
+
+    ``unconfirmed`` maps a dependency rule id to the record scope it did
+    not cover.  For row-level rules the blocked scope is the unconfirmed
+    records themselves; for cross-record rules every identity group that
+    overlaps an unconfirmed record (in either batch) is blocked, because
+    a group total cannot be re-confirmed while part of its membership is
+    unverified.  Carried conclusions for blocked records stay valid as
+    history but must not count as this run's verdict.
+    """
+    blocked = set()
+    for dep in rule.depends_on:
+        dep_unconfirmed = unconfirmed.get(dep)
+        if not dep_unconfirmed:
+            continue
+        if rule.rule_type not in CROSS_RECORD_TYPES:
+            blocked |= set(dep_unconfirmed)
+            continue
+        key_fields = rule.params.get("key_fields") or list(rule.fields)
+        if not key_fields:
+            blocked |= set(dep_unconfirmed)
+            continue
+        keys = set()
+        for rid in dep_unconfirmed:
+            for source in (old_by_id, new_by_id):
+                record = source.get(rid)
+                if record is None:
+                    continue
+                key = _identity_key(record, key_fields)
+                if key is not None:
+                    keys.add(key)
+        for source in (old_by_id, new_by_id):
+            for rid, record in source.items():
+                if _identity_key(record, key_fields) in keys:
+                    blocked.add(rid)
+        # Records with unverifiable identity block at least themselves.
+        blocked |= set(dep_unconfirmed)
+    return blocked
+
+
 def describe_plan(plans, prev_result=None):
     """Render the before/after check-plan comparison as text lines."""
     previous = {}
@@ -365,10 +412,46 @@ def incremental_evaluate(prev_result, old_batch, new_batch, rules,
     completed = []
     incomplete = []
     new_records = {r.record_id: r for r in new_batch.records}
+    old_records = {r.record_id: r for r in old_batch.records}
+    run_id = f"{new_batch.batch_id}:{version_set}:{started}"
+    plans_by_id = {plan.rule_id: plan for plan in plans}
+    # Records each rule failed to (re-)confirm this run; downstream rules
+    # use it to tell reusable carried conclusions apart from scope that
+    # cannot be re-confirmed because its upstream basis is stale.
+    unconfirmed = {}
+    extras = {}
 
     for plan in plans:
         rule = next(r for r in rules if r.rule_id == plan.rule_id)
+        blocked = _blocked_records(rule, unconfirmed, old_records, new_records)
+        upstream = {}
+        for dep in rule.depends_on:
+            dep_plan = plans_by_id[dep]
+            if dep_plan.scope == "skip" and dep not in unconfirmed:
+                upstream[dep] = {
+                    "run_id": prev_result.run_id,
+                    "use": "carried",
+                }
+            else:
+                upstream[dep] = {"run_id": run_id, "use": "current"}
+        extras[rule.rule_id] = {
+            "blocked": sorted(blocked),
+            "upstream": upstream,
+        }
         if plan.scope == "skip":
+            if blocked:
+                # The carried conclusion rests on an upstream scope that
+                # was not updated this run: keep it as history, but say
+                # plainly it is not re-confirmed and never report a pass.
+                incomplete.append(rule.rule_id)
+                unconfirmed[rule.rule_id] = set(blocked)
+                errors.append(
+                    f"rule {rule.rule_id!r}: upstream scope not updated; "
+                    f"carried conclusion for {len(blocked)} record(s) is "
+                    f"NOT re-confirmed this run: "
+                    + ",".join(sorted(blocked))
+                )
+                continue
             completed.append(rule.rule_id)
             continue
         if plan.scope == "full":
@@ -379,6 +462,9 @@ def incremental_evaluate(prev_result, old_batch, new_batch, rules,
         else:
             targets = [rid for rid in plan.targets if rid in new_records]
             replaced_ids = set(plan.replaces) - removed_ids
+        planned_targets = list(targets)
+        targets = [rid for rid in targets if rid not in blocked]
+        replaced_ids = replaced_ids - blocked
         replaced = [i for i in prev_by_rule.get(rule.rule_id, [])
                     if i.record_id in replaced_ids]
         merged = [i for i in merged if i not in replaced]
@@ -399,10 +485,11 @@ def incremental_evaluate(prev_result, old_batch, new_batch, rules,
             # plainly which scope this run failed to cover.
             merged.extend(replaced)
             incomplete.append(rule.rule_id)
+            unconfirmed[rule.rule_id] = set(planned_targets) | set(blocked)
             if plan.scope == "full":
                 covered = "all records"
             else:
-                covered = "records: " + ",".join(sorted(targets))
+                covered = "records: " + ",".join(sorted(planned_targets))
             errors.append(
                 f"rule {rule.rule_id!r} failed during incremental run: {exc}; "
                 f"kept previous conclusion; scope NOT completed this run: "
@@ -410,12 +497,23 @@ def incremental_evaluate(prev_result, old_batch, new_batch, rules,
             )
             continue
         merged.extend(produced)
-        completed.append(rule.rule_id)
+        if blocked:
+            # Partially re-confirmed: the blocked slice keeps its previous
+            # conclusion as history but is not this run's verdict.
+            incomplete.append(rule.rule_id)
+            unconfirmed[rule.rule_id] = set(blocked)
+            errors.append(
+                f"rule {rule.rule_id!r}: upstream scope not updated; "
+                f"{len(blocked)} record(s) NOT re-confirmed this run: "
+                + ",".join(sorted(blocked))
+            )
+        else:
+            completed.append(rule.rule_id)
 
     finished = utc_now()
     status = "FAILED" if merged or errors else "PASSED"
     return RunResult(
-        run_id=f"{new_batch.batch_id}:{version_set}:{started}",
+        run_id=run_id,
         batch_id=new_batch.batch_id,
         batch_checksum=new_batch.checksum,
         rule_version_set=version_set,
@@ -432,6 +530,8 @@ def incremental_evaluate(prev_result, old_batch, new_batch, rules,
                 "scope": plan.scope,
                 "targets": list(plan.targets),
                 "reasons": list(plan.reasons),
+                "blocked": extras[plan.rule_id]["blocked"],
+                "upstream": extras[plan.rule_id]["upstream"],
             }
             for plan in plans
         ),
