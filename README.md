@@ -126,3 +126,38 @@ python -m dq_platform.cli \
 
 身份拆分后重新合并、上游中断、恢复后继续核对以及无关规则正常完成的完整
 过程见 `tests/test_dependency_versions.py`。
+
+## 来源撤回与替换（第五轮）
+
+来源方发来的更正不是字段改值，而是显式关系：每个操作声明撤回哪些旧
+记录、产生哪些新记录，关系类型为 `amend`（一改一）、`split`（一拆
+多）、`merge`（多合一）或 `retract`（仅撤回）。关系必须先被使用者
+明确确认（文件内 `confirmed: true` 或 `--confirm-op`），再被
+`--accept` 接受；确认与接受都追加进 `results/corrections.jsonl`
+账本，保存到一半可用后续命令继续接受剩余操作，最终有效数据始终
+对应同一组已接受材料。
+
+```bash
+python -m dq_platform.cli --sample samples/employees_v1.json \
+  --rules samples/rules_v1.json --out results \
+  --corrections samples/corrections_v1.json \
+  --confirm-op amend-e002 --accept amend-e002
+```
+
+- 未接受的操作不进入有效数据，绝不会与当前有效资料混进同一次通过
+  结论；输出中逐项列出 `[pending]` 范围。
+- 人工确认过的问题被新记录继承时标明 `same_fact`（同一事实）或
+  `new_fact`（需要重新审查的新事实）；拆分到多个对象仍按原问题
+  计一次（解决次数不重复增加），合并后每个原问题的理由各自保留。
+- 撤回关系成环、同一旧记录被两份互斥替换引用、或更正集依赖尚未
+  接受的材料时，受影响操作的确认被明确阻止并说明原因。
+- 每次更正运行与上一轮结论对照，把问题差异分类为业务值变化
+  （`value_change`）、来源关系变化（`relation_change`）与人工决定
+  迁移（`decision_migration`）；逐次接受与完整重算的有效结果一致
+  （有测试保证），旧版本的通过/失败结论保留不回写。
+- `--acknowledge 规则:记录[:字段]` 记录人工决定，其依据是当前已
+  接受的更正集；`--retract-correction SET_ID` 撤回一项更正后，
+  会列出哪些决定重新失去依据（`basis-lost`）。
+
+完整流程（部分接受后恢复、拆分/合并继承、循环与互斥阻止、撤回后
+依据丢失）见 `tests/test_corrections.py`。

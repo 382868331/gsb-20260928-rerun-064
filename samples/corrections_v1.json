@@ -1,0 +1,42 @@
+{
+  "set_id": "corr-20261004-01",
+  "depends_on": [],
+  "operations": [
+    {
+      "op_id": "amend-e002",
+      "relation": "amend",
+      "retracts": [
+        "E002"
+      ],
+      "records": [
+        {
+          "id": "E002",
+          "id_card": "110101199002022345",
+          "hire_date": "2024-02-01",
+          "leave_date": "2024-06-01"
+        }
+      ]
+    },
+    {
+      "op_id": "split-e004",
+      "relation": "split",
+      "retracts": [
+        "E004"
+      ],
+      "records": [
+        {
+          "id": "E004a",
+          "id_card": "110101199003033456",
+          "hire_date": "2024-01-15",
+          "leave_date": "2024-02-01"
+        },
+        {
+          "id": "E004b",
+          "id_card": "110101199004044567",
+          "hire_date": "2024-03-01",
+          "leave_date": "2024-04-01"
+        }
+      ]
+    }
+  ]
+}

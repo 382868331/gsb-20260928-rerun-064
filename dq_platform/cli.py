@@ -4,6 +4,17 @@ import argparse
 import sys
 
 from .engine import evaluate
+from .corrections import (
+    CorrectionLedger,
+    DecisionLedger,
+    classify_changes,
+    effective_batch,
+    inherited_issue_count,
+    load_correction_set,
+    migrate_issues,
+    resolution_count,
+    validate_correction_set,
+)
 from .incremental import (
     dependency_impact,
     describe_plan,
@@ -41,11 +52,37 @@ def main(argv=None):
         "--lifecycle", action="store_true",
         help="update the issue lifecycle ledger (issues.jsonl) in --out",
     )
+    parser.add_argument(
+        "--corrections", default=None,
+        help="correction set JSON with retract/replace operations",
+    )
+    parser.add_argument(
+        "--accept", default="",
+        help="comma-separated correction op ids to accept, or 'all'",
+    )
+    parser.add_argument(
+        "--confirm-op", default="",
+        help="comma-separated correction op ids to explicitly confirm",
+    )
+    parser.add_argument(
+        "--retract-correction", default=None, metavar="SET_ID",
+        help="retract an accepted correction set and show decisions "
+        "that lose their basis",
+    )
+    parser.add_argument(
+        "--acknowledge", action="append", default=[],
+        metavar="RULE:RECORD[:FIELD]",
+        help="record a manual decision for an open issue",
+    )
     args = parser.parse_args(argv)
 
     batch = load_batch(args.sample, batch_id=args.batch_id)
     version_set, rules = load_rule_set(args.rules)
     store = ResultStore(args.out)
+    if args.retract_correction:
+        return _retract_correction(args)
+    if args.corrections:
+        return _run_corrections(args, batch, rules, version_set, store)
     prev_result = None
     if args.prev_sample:
         prev_batch = load_batch(args.prev_sample, batch_id=args.prev_batch_id)
@@ -124,6 +161,212 @@ def main(argv=None):
                     print(f"    rule={key[0]} record={key[1]} field={key[2]}")
     if result.status == "PASSED":
         print(f"all {len(batch.records)} records passed")
+        return 0
+    print("check FAILED - do not treat the batch as qualified")
+    return 1
+
+
+def _split_csv(value):
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _retract_correction(args):
+    ledger = CorrectionLedger(args.out)
+    ledger.retract_set(args.retract_correction)
+    decisions = DecisionLedger(args.out)
+    lost = decisions.retract_basis(args.retract_correction)
+    print(f"correction set {args.retract_correction} retracted")
+    for event in lost:
+        print(
+            f"  [basis-lost] decision {event['decision']!r} on "
+            f"{':'.join(event['key'])} no longer has an accepted basis"
+        )
+    if not lost:
+        print("  no manual decisions depended on this set")
+    return 1 if lost else 0
+
+
+def _run_corrections(args, batch, rules, version_set, store):
+    cset = load_correction_set(args.corrections)
+    ledger = CorrectionLedger(args.out)
+    for op_id in _split_csv(args.confirm_op):
+        op = next((o for o in cset["ops"] if o["op_id"] == op_id), None)
+        if op is None:
+            raise SystemExit(f"unknown op to confirm: {op_id}")
+        ledger.confirm(cset["set_id"], op_id, op["relation"])
+
+    errors, blocked = validate_correction_set(cset, ledger)
+    for error in errors:
+        print(f"  [blocked] {error}")
+
+    confirmed = ledger.confirmed_ops()
+
+    def is_confirmed(op):
+        return (
+            op["confirmed"]
+            or (cset["set_id"], op["op_id"]) in confirmed
+        )
+
+    prior_active = ledger.active_accepted()
+    already = {
+        e["op_id"] for e in prior_active if e["set_id"] == cset["set_id"]
+    }
+    pending = [op for op in cset["ops"] if op["op_id"] not in already]
+    accept_arg = set(_split_csv(args.accept))
+    if "all" in accept_arg:
+        to_accept = [
+            op for op in pending
+            if is_confirmed(op) and op["op_id"] not in blocked
+        ]
+    else:
+        unknown = accept_arg - {op["op_id"] for op in cset["ops"]}
+        if unknown:
+            raise SystemExit(
+                "unknown op ids: " + ", ".join(sorted(unknown))
+            )
+        to_accept = [op for op in pending if op["op_id"] in accept_arg]
+    for op in to_accept:
+        if op["op_id"] in blocked:
+            print(
+                f"  [blocked] op {op['op_id']} cannot be confirmed; "
+                "affected scope is NOT accepted"
+            )
+            return 1
+        if not is_confirmed(op):
+            print(
+                f"  [blocked] op {op['op_id']} needs explicit confirmation "
+                "(--confirm-op) before its relation is applied"
+            )
+            return 1
+    for op in to_accept:
+        ledger.accept(cset["set_id"], op)
+    skipped = [op for op in pending if op not in to_accept]
+    for op in skipped:
+        print(
+            f"  [pending] op {op['op_id']} ({op['relation']}) not accepted; "
+            "excluded from this run's effective data"
+        )
+
+    prev_effective, _ = effective_batch(batch, prior_active)
+    active = ledger.active_accepted()
+    eff_batch, relations = effective_batch(batch, active)
+    new_relations = (
+        tuple(relations[len(relations) - len(to_accept):])
+        if to_accept else ()
+    )
+
+    prev_result = None
+    for doc in reversed(store.conclusions_for_batch(batch.batch_id)):
+        if doc["rule_version_set"] == version_set:
+            prev_result = _result_from_dict(doc)
+            break
+
+    result = evaluate(eff_batch, rules)
+    store.append(result)
+
+    prev_issues = prev_result.issues if prev_result is not None else ()
+    migrations = migrate_issues(
+        prev_issues, new_relations,
+        prev_effective.records, eff_batch.records,
+    )
+    changes = classify_changes(
+        prev_issues, result.issues, migrations,
+        prev_effective.records, eff_batch.records,
+    )
+
+    print(
+        f"corrections set={cset['set_id']} accepted={len(to_accept)} "
+        f"pending={len(skipped)} "
+        f"effective_records={len(eff_batch.records)}"
+    )
+    for rel in new_relations:
+        print(
+            f"  [relation:{rel['relation']}] op={rel['op_id']} "
+            f"retracts={','.join(rel['retracts']) or '-'} "
+            f"produces={','.join(rel['produces']) or '-'}"
+        )
+    for entry in migrations:
+        origin = ":".join(entry["origin"])
+        if entry["resolved_by_correction"]:
+            print(
+                f"  [migrated:resolved] {origin} resolved by "
+                f"{entry['relation']} op {entry['op_id']}"
+            )
+        for target in entry["targets"]:
+            if target["inheritance"] == "same_fact":
+                label = "same fact inherited"
+            else:
+                label = "NEW fact - needs fresh review"
+            print(
+                f"  [migrated:{target['inheritance']}] {origin} -> "
+                f"{target['record_id']}: {label}"
+            )
+    if migrations:
+        print(
+            "  inherited open problems (dedup by origin): "
+            f"{inherited_issue_count(migrations)}; resolutions from "
+            f"corrections (one per origin): {resolution_count(migrations)}"
+        )
+    if prev_result is not None:
+        for kind in ("value_change", "relation_change",
+                     "decision_migration"):
+            keys = changes[kind]
+            if keys:
+                print(f"  [change:{kind}] {len(keys)} issue(s)")
+                for key in keys:
+                    print(
+                        f"    rule={key[0]} record={key[1]} field={key[2]}"
+                    )
+
+    print(
+        f"batch={result.batch_id} rules={version_set} "
+        f"status={result.status}"
+    )
+    for issue in result.issues:
+        print(
+            f"  [{issue.kind}] record={issue.record_id} "
+            f"rule={issue.rule_id} field={issue.field} :: {issue.detail}"
+        )
+    for error in result.errors:
+        print(f"  [error] {error}")
+
+    if args.acknowledge:
+        decisions = DecisionLedger(args.out)
+        basis = ledger.accepted_set_ids()
+        for spec in args.acknowledge:
+            parts = spec.split(":")
+            key = None
+            for issue in result.issues:
+                if (issue.rule_id == parts[0]
+                        and issue.record_id == parts[1]
+                        and (len(parts) < 3 or issue.field == parts[2])):
+                    key = (
+                        issue.rule_id, issue.record_id,
+                        issue.field, issue.kind,
+                    )
+                    break
+            if key is None:
+                print(f"  [acknowledge] no open issue matches {spec}")
+                continue
+            decisions.confirm(key, "acknowledged", basis, result.run_id)
+            print(
+                f"  [decision] acknowledged {':'.join(key)} "
+                f"(basis: {','.join(sorted(basis)) or 'base data'})"
+            )
+
+    if args.lifecycle:
+        tracker = IssueTracker(args.out)
+        transitions = tracker.update(result)
+        for kind in ("opened", "reopened", "resolved", "condition_changed",
+                     "unknown"):
+            keys = transitions[kind]
+            if keys:
+                print(f"  [lifecycle:{kind}] {len(keys)} issue(s)")
+
+    if result.status == "PASSED":
+        print(f"all {len(eff_batch.records)} records passed")
         return 0
     print("check FAILED - do not treat the batch as qualified")
     return 1
