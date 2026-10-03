@@ -126,3 +126,28 @@ python -m dq_platform.cli \
 
 身份拆分后重新合并、上游中断、恢复后继续核对以及无关规则正常完成的完整
 过程见 `tests/test_dependency_versions.py`。
+
+## 撤回与替换材料（第五轮）
+
+来源方的撤回、替换、拆分与合并不是普通字段改值。平台用
+`dq_platform.corrections` 单独描述材料关系：
+
+- `Correction` 明确列出撤回的旧记录、替换后的新记录、新记录继承的来源、
+  更正依赖以及后续撤回的更正；`Acceptance` 表示使用者明确接受哪些材料。
+- 一条旧记录可拆成多条，多条旧记录也可合并为一条；未明确接受的替换
+  记录不会进入有效批次，也不能与当前有效资料混在同一次通过结论中。
+- `IssueMigration` 区分 `same_fact`（同一事实，需要人工理由）与
+  `review_new_fact`（需要重新审查的新事实）；拆分时一个旧问题不会因为
+  多个目标而重复解决，合并时各旧问题的原理由在 `source_reasons` 中保留。
+- 撤回关系形成循环、同一旧记录被互斥替换同时引用、更正依赖尚未接受，
+  或部分替换未接受时，仅受影响身份/业务分组和下游结论标记为 blocked；
+  无关检查仍可独立完成。
+- 即使业务值完全相同，来源关系变化也会强制重新确认身份检查、分组总额
+  和依赖依据；`accepted_material.lineage` 保存来源、关系和材料指纹。
+- `compare_effective_results` 分开报告业务值变化、来源关系变化和人工
+  决定迁移；后来撤回更正时，`decisions_without_basis` 可列出重新失去
+  依据的人工决定，问题账本写入 `basis_lost`。
+
+推荐入口是 `evaluate_corrections(...)`。先得到只包含已接受材料的有效批次，
+再做增量检查；结果中的 `accepted_material`、结论版本和问题生命周期均对应
+同一组已接受材料。完整端到端场景见 `tests/test_corrections.py`。

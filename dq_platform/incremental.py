@@ -135,7 +135,7 @@ def _definition_changed(rule, prev_rules):
 
 
 def build_plan(rules, old_batch, new_batch, prev_rules=None,
-               prev_incomplete=(), prev_conclusions=()):
+               prev_incomplete=(), prev_conclusions=(), material_records=()):
     """Plan each rule's re-check scope for the old->new batch diff.
 
     Returns RulePlan entries in dependency order.  Every plan names the
@@ -147,6 +147,7 @@ def build_plan(rules, old_batch, new_batch, prev_rules=None,
     fchanges = field_changes(old_batch, new_batch)
     old_by_id = {r.record_id: r for r in old_batch.records}
     new_by_id = {r.record_id: r for r in new_batch.records}
+    material_records = tuple(dict.fromkeys(material_records))
     prev_incomplete = set(prev_incomplete)
     prior_units = {}
     for conclusion in prev_conclusions or ():
@@ -179,6 +180,16 @@ def build_plan(rules, old_batch, new_batch, prev_rules=None,
             reasons.append("added records: " + ", ".join(added))
         if removed:
             reasons.append("removed records: " + ", ".join(removed))
+        if material_records:
+            relevant_material = tuple(
+                rid for rid in material_records
+                if rid in old_by_id or rid in new_by_id
+            )
+            if relevant_material:
+                reasons.append(
+                    "source relationship changed for records: "
+                    + ", ".join(relevant_material)
+                )
 
         dep_targets = []
         dep_full = False
@@ -207,7 +218,9 @@ def build_plan(rules, old_batch, new_batch, prev_rules=None,
                 + ", ".join(sorted(upstream_blocked & set(new_by_id)))
             )
 
-        touched = tuple(dict.fromkeys((*modified, *added, *dep_targets)))
+        touched = tuple(dict.fromkeys((
+            *modified, *added, *dep_targets, *material_records
+        )))
 
         if prev_rules is not None and _definition_changed(rule, prev_rules):
             plans[rule.rule_id] = RulePlan(
@@ -316,7 +329,7 @@ def build_plan(rules, old_batch, new_batch, prev_rules=None,
 
 
 def plan_scopes(rules, old_batch, new_batch, prev_rules=None,
-                prev_incomplete=(), prev_conclusions=()):
+                prev_incomplete=(), prev_conclusions=(), material_records=()):
     """Map each rule id to "full", "records", "groups" or "skip"."""
     return {
         plan.rule_id: plan.scope
@@ -324,6 +337,7 @@ def plan_scopes(rules, old_batch, new_batch, prev_rules=None,
             rules, old_batch, new_batch,
             prev_rules=prev_rules, prev_incomplete=prev_incomplete,
             prev_conclusions=prev_conclusions,
+            material_records=material_records,
         )
     }
 
@@ -572,7 +586,8 @@ preview_dependency_impact = dependency_impact
 
 
 def incremental_evaluate(prev_result, old_batch, new_batch, rules,
-                         prev_rules=None):
+                         prev_rules=None, material_records=(),
+                         accepted_material=None):
     """Re-check new_batch against rules, reusing prev_result where safe.
 
     Falls back to a full evaluation when there is no comparable baseline
@@ -592,6 +607,7 @@ def incremental_evaluate(prev_result, old_batch, new_batch, rules,
             prev_rules=prev_rules,
             prev_incomplete=prev_result.incomplete_rules,
             prev_conclusions=prev_result.conclusions,
+            material_records=material_records,
         )
     except DependencyError as exc:
         finished = utc_now()
@@ -800,6 +816,7 @@ def incremental_evaluate(prev_result, old_batch, new_batch, rules,
         completed_rules=tuple(dict.fromkeys(completed)),
         incomplete_rules=tuple(dict.fromkeys(incomplete)),
         conclusions=tuple(carried_conclusions),
+        accepted_material=accepted_material,
         plan=tuple(
             {
                 "rule_id": plan.rule_id,

@@ -161,6 +161,7 @@ def _result_from_dict(doc):
         incomplete_rules=tuple(doc.get("incomplete_rules", ())),
         plan=tuple(doc.get("plan", ())),
         conclusions=tuple(doc.get("conclusions", ())),
+        accepted_material=doc.get("accepted_material", {}),
     )
 
 

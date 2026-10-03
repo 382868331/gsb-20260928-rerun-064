@@ -90,6 +90,9 @@ class RunResult:
     # Incremental check plan: one dict per rule with scope/targets/reasons,
     # so the executed scope can be audited against the previous run.
     plan: tuple = ()
+    # Source corrections explicitly accepted before this conclusion was
+    # formed. Unaccepted replacement material is never included here.
+    accepted_material: dict = field(default_factory=dict)
     # Versioned rule conclusions. Each unit is one record (row rules) or
     # one dependency group (cross-record rules), and records the upstream
     # conclusion versions actually used.
