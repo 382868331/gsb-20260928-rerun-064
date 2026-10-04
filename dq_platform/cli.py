@@ -13,7 +13,9 @@ from .corrections import (
     load_correction_set,
     migrate_issues,
     resolution_count,
+    validate_acceptance_scope,
     validate_correction_set,
+    validate_set_retraction,
 )
 from .incremental import (
     dependency_impact,
@@ -174,6 +176,13 @@ def _split_csv(value):
 
 def _retract_correction(args):
     ledger = CorrectionLedger(args.out)
+    errors, _ = validate_set_retraction(
+        args.retract_correction, ledger.active_accepted(),
+    )
+    if errors:
+        for error in errors:
+            print(f"  [blocked] {error}")
+        return 1
     ledger.retract_set(args.retract_correction)
     decisions = DecisionLedger(args.out)
     lost = decisions.retract_basis(args.retract_correction)
@@ -197,8 +206,10 @@ def _run_corrections(args, batch, rules, version_set, store):
             raise SystemExit(f"unknown op to confirm: {op_id}")
         ledger.confirm(cset["set_id"], op_id, op["relation"])
 
-    errors, blocked = validate_correction_set(cset, ledger)
-    for error in errors:
+    relation_errors, relation_blocked = validate_correction_set(
+        cset, ledger,
+    )
+    for error in relation_errors:
         print(f"  [blocked] {error}")
 
     confirmed = ledger.confirmed_ops()
@@ -215,34 +226,49 @@ def _run_corrections(args, batch, rules, version_set, store):
     }
     pending = [op for op in cset["ops"] if op["op_id"] not in already]
     accept_arg = set(_split_csv(args.accept))
-    if "all" in accept_arg:
-        to_accept = [
-            op for op in pending
-            if is_confirmed(op) and op["op_id"] not in blocked
-        ]
-    else:
+    if "all" not in accept_arg:
         unknown = accept_arg - {op["op_id"] for op in cset["ops"]}
         if unknown:
             raise SystemExit(
                 "unknown op ids: " + ", ".join(sorted(unknown))
             )
-        to_accept = [op for op in pending if op["op_id"] in accept_arg]
+    requested_ops = (
+        pending if "all" in accept_arg
+        else [op for op in pending if op["op_id"] in accept_arg]
+    )
+    identity_errors, identity_blocked = validate_acceptance_scope(
+        batch, prior_active, requested_ops,
+    )
+    for error in identity_errors:
+        print(f"  [blocked] {error}")
+    blocked = relation_blocked | identity_blocked
+    if "all" in accept_arg:
+        to_accept = [
+            op for op in requested_ops
+            if is_confirmed(op) and op["op_id"] not in blocked
+        ]
+    else:
+        to_accept = requested_ops
+    rejected = set()
     for op in to_accept:
         if op["op_id"] in blocked:
             print(
                 f"  [blocked] op {op['op_id']} cannot be confirmed; "
                 "affected scope is NOT accepted"
             )
-            return 1
+            rejected.add(op["op_id"])
+            continue
         if not is_confirmed(op):
             print(
                 f"  [blocked] op {op['op_id']} needs explicit confirmation "
                 "(--confirm-op) before its relation is applied"
             )
-            return 1
-    for op in to_accept:
+            rejected.add(op["op_id"])
+            continue
         ledger.accept(cset["set_id"], op)
-    skipped = [op for op in pending if op not in to_accept]
+    to_accept = [op for op in to_accept if op["op_id"] not in rejected]
+    accepted_ids = {op["op_id"] for op in to_accept}
+    skipped = [op for op in pending if op["op_id"] not in accepted_ids]
     for op in skipped:
         print(
             f"  [pending] op {op['op_id']} ({op['relation']}) not accepted; "
@@ -252,9 +278,9 @@ def _run_corrections(args, batch, rules, version_set, store):
     prev_effective, _ = effective_batch(batch, prior_active)
     active = ledger.active_accepted()
     eff_batch, relations = effective_batch(batch, active)
-    new_relations = (
-        tuple(relations[len(relations) - len(to_accept):])
-        if to_accept else ()
+    new_relations = tuple(
+        rel for rel in relations
+        if rel["set_id"] == cset["set_id"] and rel["op_id"] in accepted_ids
     )
 
     prev_result = None
@@ -365,6 +391,12 @@ def _run_corrections(args, batch, rules, version_set, store):
             if keys:
                 print(f"  [lifecycle:{kind}] {len(keys)} issue(s)")
 
+    if rejected:
+        print(
+            "correction acceptance blocked; current effective data was "
+            "preserved for the blocked scope"
+        )
+        return 1
     if result.status == "PASSED":
         print(f"all {len(eff_batch.records)} records passed")
         return 0

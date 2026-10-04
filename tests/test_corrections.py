@@ -131,6 +131,104 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(blocked, set())
 
+    def test_replacement_cannot_collide_with_untargeted_current_id(self):
+        batch = load_batch_write(self.tmp.name, [
+            {"id": "a", "department": "g", "amount": 10},
+            {"id": "b", "department": "g", "amount": 20},
+        ])
+        cset = self.load({
+            "set_id": "s1",
+            "operations": [{
+                "op_id": "split-a", "relation": "split",
+                "retracts": ["a"],
+                "records": [
+                    {"id": "x", "department": "g", "amount": 4},
+                    {"id": "b", "department": "g", "amount": 6},
+                ],
+            }],
+        })
+        errors, blocked = corr.validate_acceptance_scope(
+            batch, (), cset["ops"],
+        )
+        self.assertEqual(blocked, {"split-a"})
+        self.assertTrue(any("existing identity 'b'" in e for e in errors))
+        effective, _ = corr.effective_batch(batch, ())
+        self.assertEqual(
+            [(r.record_id, r.data["amount"]) for r in effective.records],
+            [("a", 10), ("b", 20)],
+        )
+
+    def test_duplicate_outputs_are_blocked_within_one_correction(self):
+        batch = load_batch_write(self.tmp.name, [
+            {"id": "a", "department": "g", "amount": 10},
+        ])
+        cset = self.load({
+            "set_id": "s1",
+            "operations": [{
+                "op_id": "split-a", "relation": "split",
+                "retracts": ["a"],
+                "records": [
+                    {"id": "x", "amount": 4},
+                    {"id": "x", "amount": 6},
+                ],
+            }],
+        })
+        errors, blocked = corr.validate_acceptance_scope(
+            batch, (), cset["ops"],
+        )
+        self.assertEqual(blocked, {"split-a"})
+        self.assertTrue(any("duplicate identity 'x'" in e for e in errors))
+
+    def test_cross_operation_duplicate_output_blocks_only_later_scope(self):
+        batch = load_batch_write(self.tmp.name, [
+            {"id": "a", "department": "g", "amount": 4},
+            {"id": "c", "department": "g", "amount": 6},
+        ])
+        cset = self.load({
+            "set_id": "s1",
+            "operations": [
+                {"op_id": "split-a", "relation": "split",
+                 "retracts": ["a"],
+                 "records": [
+                     {"id": "x", "department": "g", "amount": 2},
+                     {"id": "y", "department": "g", "amount": 2},
+                 ]},
+                {"op_id": "amend-c-to-x", "relation": "amend",
+                 "retracts": ["c"],
+                 "records": [
+                     {"id": "x", "department": "g", "amount": 6},
+                 ]},
+            ],
+        })
+        errors, blocked = corr.validate_acceptance_scope(
+            batch, (), cset["ops"],
+        )
+        self.assertEqual(blocked, {"amend-c-to-x"})
+        self.assertTrue(any("existing identity 'x'" in e for e in errors))
+
+    def test_set_retraction_is_blocked_while_dependent_set_is_active(self):
+        self.ledger.accept("s1", {
+            "op_id": "make-z", "relation": "amend",
+            "retracts": ("a",), "records": ({"id": "z"},),
+            "produces": ("z",),
+        })
+        self.ledger.accept("s2", {
+            "op_id": "change-z", "relation": "amend",
+            "depends_on": ("s1",), "retracts": ("z",),
+            "records": ({"id": "q"},), "produces": ("q",),
+        })
+        errors, blocked = corr.validate_set_retraction(
+            "s1", self.ledger.active_accepted(),
+        )
+        self.assertEqual(blocked, {"s2"})
+        self.assertTrue("still depend" in errors[0])
+
+
+def load_batch_write(tmp_path, records):
+    path = Path(tmp_path) / "sample.json"
+    path.write_text(json.dumps(records), encoding="utf-8")
+    return load_batch(str(path))
+
 
 class MigrationTests(unittest.TestCase):
     def test_split_follows_the_fact(self):
@@ -264,6 +362,99 @@ class CliFlowTests(unittest.TestCase):
     def base_args(self):
         return ["--sample", self.sample, "--rules", self.rules,
                 "--out", self.out, "--corrections", self.cset]
+
+    def write_identity_amount_case(self):
+        sample = Path(self.tmp.name) / "amounts.json"
+        rules = Path(self.tmp.name) / "amount-rules.json"
+        first = Path(self.tmp.name) / "corrections-first.json"
+        reopened = Path(self.tmp.name) / "corrections-reopened.json"
+        sample.write_text(json.dumps([
+            {"id": "a", "department": "g", "amount": 10},
+            {"id": "b", "department": "g", "amount": 20},
+            {"id": "c", "department": "g", "amount": 0},
+        ]), encoding="utf-8")
+        rules.write_text(json.dumps({
+            "version_set": "amount-v1",
+            "rules": [
+                {"id": "identity", "type": "unique_fields",
+                 "params": {"key_fields": ["id"]}},
+                {"id": "total", "type": "grouped_sum",
+                 "params": {"group_fields": ["department"],
+                            "amount_field": "amount", "max_total": 30},
+                 "depends_on": ["identity"]},
+            ],
+        }), encoding="utf-8")
+        first.write_text(json.dumps({
+            "set_id": "amount-s1",
+            "operations": [
+                {"op_id": "independent-retract-c", "relation": "retract",
+                 "retracts": ["c"]},
+                {"op_id": "bad-split-a-to-b", "relation": "split",
+                 "retracts": ["a"],
+                 "records": [
+                     {"id": "x", "department": "g", "amount": 4},
+                     {"id": "b", "department": "g", "amount": 6},
+                 ]},
+            ],
+        }), encoding="utf-8")
+        reopened.write_text(json.dumps({
+            "set_id": "amount-s2", "depends_on": ["amount-s1"],
+            "operations": [{
+                "op_id": "reopened-bad-split-a-to-b",
+                "relation": "split", "retracts": ["a"],
+                "records": [
+                    {"id": "x", "department": "g", "amount": 4},
+                    {"id": "b", "department": "g", "amount": 6},
+                ],
+            }],
+        }), encoding="utf-8")
+        return str(sample), str(rules), str(first), str(reopened)
+
+    def test_conflicting_split_is_scoped_blocked_and_survives_reopen(self):
+        sample, rules, first, reopened = self.write_identity_amount_case()
+        code, out = self.run_cli(
+            "--sample", sample, "--rules", rules, "--out", self.out,
+            "--corrections", first,
+            "--confirm-op", "independent-retract-c,bad-split-a-to-b",
+            "--accept", "independent-retract-c,bad-split-a-to-b",
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("produces existing identity 'b'", out)
+        self.assertIn("accepted=1", out)
+        self.assertIn("[pending] op bad-split-a-to-b", out)
+        self.assertIn("status=PASSED", out)
+        self.assertIn("blocked scope", out)
+
+        ledger = corr.CorrectionLedger(self.out)
+        self.assertEqual(
+            [e["op_id"] for e in ledger.active_accepted()],
+            ["independent-retract-c"],
+        )
+        batch = load_batch(sample)
+        effective, _ = corr.effective_batch(batch, ledger.active_accepted())
+        self.assertEqual(
+            [(r.record_id, r.data["amount"]) for r in effective.records],
+            [("a", 10), ("b", 20)],
+        )
+
+        code, out = self.run_cli(
+            "--sample", sample, "--rules", rules, "--out", self.out,
+            "--corrections", reopened, "--confirm-op",
+            "reopened-bad-split-a-to-b", "--accept",
+            "reopened-bad-split-a-to-b",
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("produces existing identity 'b'", out)
+        self.assertIn("accepted=0", out)
+        self.assertEqual(
+            [e["op_id"] for e in ledger.active_accepted()],
+            ["independent-retract-c"],
+        )
+        effective, _ = corr.effective_batch(batch, ledger.active_accepted())
+        self.assertEqual(
+            [(r.record_id, r.data["amount"]) for r in effective.records],
+            [("a", 10), ("b", 20)],
+        )
 
     def test_unconfirmed_relation_cannot_be_accepted(self):
         code, out = self.run_cli(

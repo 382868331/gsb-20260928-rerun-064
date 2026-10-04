@@ -77,6 +77,7 @@ def load_correction_set(path):
         ops.append({
             "op_id": op_id,
             "relation": relation,
+            "depends_on": tuple(str(d) for d in doc.get("depends_on", ())),
             "retracts": retracts,
             "records": records,
             "produces": produces,
@@ -123,6 +124,7 @@ class CorrectionLedger:
             "set_id": set_id,
             "op_id": op["op_id"],
             "relation": op["relation"],
+            "depends_on": list(op.get("depends_on", ())),
             "retracts": list(op["retracts"]),
             "records": list(op["records"]),
             "produces": list(op["produces"]),
@@ -154,6 +156,36 @@ class CorrectionLedger:
 
     def accepted_set_ids(self):
         return {e["set_id"] for e in self.active_accepted()}
+
+
+def validate_set_retraction(set_id, active_events):
+    """Reject retracting a set while active corrections still depend on it."""
+    dependents = set()
+    for event in active_events:
+        active_set = event["set_id"]
+        for dep in event.get("depends_on", ()):
+            if dep == set_id:
+                dependents.add(active_set)
+
+    changed = True
+    while changed:
+        changed = False
+        for event in active_events:
+            active_set = event["set_id"]
+            if active_set in dependents:
+                continue
+            if any(dep in dependents or dep == set_id
+                   for dep in event.get("depends_on", ())):
+                dependents.add(active_set)
+                changed = True
+
+    if not dependents:
+        return [], set()
+    errors = [
+        f"cannot retract correction set {set_id!r}: active correction sets "
+        "still depend on it: " + ", ".join(sorted(dependents))
+    ]
+    return errors, dependents
 
 
 def validate_correction_set(cset, ledger):
@@ -243,35 +275,120 @@ def effective_batch(batch, accepted_events):
     Unaccepted operations contribute nothing, so pending corrections are
     never mixed into the same conclusion as the effective data.
     """
-    data = {r.record_id: r.data for r in batch.records}
-    order = [r.record_id for r in batch.records]
+    records = list(batch.records)
     relations = []
     for event in accepted_events:
+        produces = tuple(event.get("produces", ()))
+        if len(set(produces)) != len(produces):
+            duplicated = sorted({
+                rid for rid in produces if produces.count(rid) > 1
+            })
+            raise CorrectionError(
+                f"op {event.get('op_id')!r} produces duplicate identities: "
+                + ", ".join(duplicated)
+            )
         for rid in event.get("retracts", ()):
-            if rid in data:
-                del data[rid]
-                order.remove(rid)
+            matches = [idx for idx, record in enumerate(records)
+                       if record.record_id == rid]
+            if len(matches) != 1:
+                raise CorrectionError(
+                    f"op {event.get('op_id')!r} retracts {len(matches)} "
+                    f"current record(s) with identity {rid!r}; expected one"
+                )
+            del records[matches[0]]
         for idx, record_data in enumerate(event.get("records", ())):
             rid = str(record_data.get("id", f"{event['op_id']}-{idx}"))
-            data[rid] = record_data
-            order.append(rid)
+            if any(record.record_id == rid for record in records):
+                raise CorrectionError(
+                    f"op {event.get('op_id')!r} produces identity {rid!r} "
+                    "without retracting the current record with that identity"
+                )
+            records.append(Record(
+                record_id=rid,
+                index=len(records),
+                data=record_data,
+            ))
         relations.append({
             "set_id": event["set_id"],
             "op_id": event["op_id"],
             "relation": event["relation"],
+            "depends_on": tuple(event.get("depends_on", ())),
             "retracts": tuple(event.get("retracts", ())),
             "produces": tuple(event.get("produces", ())),
         })
-    records = tuple(
-        Record(record_id=rid, index=idx, data=data[rid])
-        for idx, rid in enumerate(order)
-    )
     return Batch(
         batch_id=batch.batch_id,
         source=batch.source + "+corrections",
         loaded_at=utc_now(),
-        records=records,
+        records=tuple(records),
     ), relations
+
+
+def validate_acceptance_scope(batch, accepted_events, ops):
+    """Validate candidate ops against the identities currently in effect.
+
+    The check is intentionally scoped to the requested operations and is
+    replayed in operation order.  A rejected operation is not applied to the
+    simulated state, so an independent operation can still be accepted while
+    operations touching the conflicting identity remain blocked.
+    """
+    if accepted_events:
+        effective, _ = effective_batch(batch, accepted_events)
+        current = [record.record_id for record in effective.records]
+    else:
+        current = [record.record_id for record in batch.records]
+
+    errors = []
+    blocked = set()
+    for op in ops:
+        op_errors = []
+        produced_counts = {}
+        for rid in op["produces"]:
+            produced_counts[rid] = produced_counts.get(rid, 0) + 1
+        for rid, count in produced_counts.items():
+            if count > 1:
+                op_errors.append(
+                    f"op {op['op_id']!r} produces duplicate identity {rid!r}"
+                )
+
+        retracted = set()
+        for rid in op["retracts"]:
+            count = current.count(rid)
+            if count == 0:
+                op_errors.append(
+                    f"op {op['op_id']!r} retracts {rid!r}, which is not a "
+                    "single current effective identity"
+                )
+            elif count > 1:
+                op_errors.append(
+                    f"op {op['op_id']!r} cannot retract ambiguous identity "
+                    f"{rid!r}: {count} current records use it"
+                )
+            elif rid in retracted:
+                op_errors.append(
+                    f"op {op['op_id']!r} retracts identity {rid!r} more "
+                    "than once"
+                )
+            retracted.add(rid)
+
+        remaining_current = [rid for rid in current if rid not in retracted]
+        for rid in op["produces"]:
+            if remaining_current.count(rid):
+                op_errors.append(
+                    f"op {op['op_id']!r} produces existing identity {rid!r} "
+                    "but does not declare it in retracts"
+                )
+
+        if op_errors:
+            blocked.add(op["op_id"])
+            errors.extend(op_errors)
+            continue
+
+        for rid in op["retracts"]:
+            current.remove(rid)
+        current.extend(op["produces"])
+
+    return errors, blocked
 
 
 def _fact_value(record, field):
