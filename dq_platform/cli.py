@@ -7,6 +7,8 @@ from .engine import evaluate
 from .corrections import (
     CorrectionLedger,
     DecisionLedger,
+    check_acceptance_identities,
+    check_retraction_identities,
     classify_changes,
     effective_batch,
     inherited_issue_count,
@@ -174,6 +176,19 @@ def _split_csv(value):
 
 def _retract_correction(args):
     ledger = CorrectionLedger(args.out)
+    batch = load_batch(args.sample, batch_id=args.batch_id)
+    errors, _blocked = check_retraction_identities(
+        batch, ledger, args.retract_correction,
+    )
+    if errors:
+        for error in errors:
+            print(f"  [blocked] {error}")
+        print(
+            f"correction set {args.retract_correction} NOT retracted: "
+            "doing so would leave duplicate/overwritten identities; the "
+            "current effective data is preserved"
+        )
+        return 1
     ledger.retract_set(args.retract_correction)
     decisions = DecisionLedger(args.out)
     lost = decisions.retract_basis(args.retract_correction)
@@ -240,6 +255,19 @@ def _run_corrections(args, batch, rules, version_set, store):
                 "(--confirm-op) before its relation is applied"
             )
             return 1
+    identity_errors, identity_blocked = check_acceptance_identities(
+        batch, ledger, cset,
+        [op["op_id"] for op in to_accept],
+    )
+    rejected_accept = bool(identity_errors)
+    for error in identity_errors:
+        print(f"  [blocked] {error}")
+    for op_id in sorted(identity_blocked):
+        print(
+            f"  [blocked] op {op_id} identity check failed; affected "
+            "scope is NOT accepted and the original data is preserved"
+        )
+    to_accept = [op for op in to_accept if op["op_id"] not in identity_blocked]
     for op in to_accept:
         ledger.accept(cset["set_id"], op)
     skipped = [op for op in pending if op not in to_accept]
@@ -365,9 +393,14 @@ def _run_corrections(args, batch, rules, version_set, store):
             if keys:
                 print(f"  [lifecycle:{kind}] {len(keys)} issue(s)")
 
-    if result.status == "PASSED":
+    if result.status == "PASSED" and not rejected_accept:
         print(f"all {len(eff_batch.records)} records passed")
         return 0
+    if rejected_accept:
+        print(
+            "acceptance blocked for an identity conflict - do not treat "
+            "the blocked scope as part of the effective data"
+        )
     print("check FAILED - do not treat the batch as qualified")
     return 1
 

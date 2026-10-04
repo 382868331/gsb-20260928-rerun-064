@@ -356,5 +356,262 @@ class CliFlowTests(unittest.TestCase):
         self.assertEqual(active[0]["basis_sets"], ["corr-20261004-01"])
 
 
+class IdentityGuardTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.out = str(root / "results")
+        self.sample_path = root / "amounts.json"
+        self.rules_path = root / "rules.json"
+        self.sample_path.write_text(json.dumps([
+            {"id": "a", "department": "g", "amount": 10},
+            {"id": "b", "department": "g", "amount": 20},
+        ]), encoding="utf-8")
+        self.rules_path.write_text(json.dumps({
+            "version_set": "sum-v1",
+            "rules": [
+                {"id": "id_present", "type": "required_fields",
+                 "fields": ["id", "department"]},
+                {"id": "id_unique", "type": "unique_fields",
+                 "params": {"key_fields": ["id"]},
+                 "depends_on": ["id_present"]},
+                {"id": "group_total", "type": "grouped_sum",
+                 "params": {"group_fields": ["department"],
+                            "amount_field": "amount",
+                            "max_total": 30},
+                 "depends_on": ["id_unique"]},
+            ],
+        }), encoding="utf-8")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def cset_path(self, doc, name="cset.json"):
+        path = Path(self.tmp.name) / name
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        return str(path)
+
+    def run_cli(self, cset, *extra):
+        buf = io.StringIO()
+        argv = [
+            "--sample", str(self.sample_path),
+            "--rules", str(self.rules_path),
+            "--out", self.out, "--corrections", cset,
+        ] + list(extra)
+        with contextlib.redirect_stdout(buf):
+            code = main(argv)
+        return code, buf.getvalue()
+
+    def effective_amounts(self):
+        batch = load_batch(str(self.sample_path))
+        ledger = corr.CorrectionLedger(self.out)
+        eff, _ = corr.effective_batch(batch, ledger.active_accepted())
+        amounts = {r.record_id: r.data["amount"] for r in eff.records}
+        return amounts, [e["op_id"] for e in ledger.active_accepted()]
+
+    def split_set(self, second_id="y"):
+        return self.cset_path({
+            "set_id": "s-split",
+            "operations": [{
+                "op_id": "split-a", "relation": "split",
+                "retracts": ["a"],
+                "records": [
+                    {"id": "x", "department": "g", "amount": 4},
+                    {"id": second_id, "department": "g", "amount": 6},
+                ],
+            }],
+        })
+
+    def test_normal_split_keeps_total_and_passes(self):
+        code, out = self.run_cli(
+            self.split_set(), "--confirm-op", "split-a", "--accept", "all",
+        )
+        self.assertEqual(code, 0, out)
+        amounts, accepted = self.effective_amounts()
+        self.assertEqual(accepted, ["split-a"])
+        self.assertEqual(amounts, {"b": 20, "x": 4, "y": 6})
+        self.assertEqual(sum(amounts.values()), 30)
+        self.assertNotIn("[blocked]", out)
+
+    def test_split_output_renamed_to_unrelated_b_is_blocked(self):
+        code, out = self.run_cli(
+            self.split_set(second_id="b"),
+            "--confirm-op", "split-a", "--accept", "all",
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("would overwrite", out)
+        self.assertIn("b", out)
+        # Nothing is accepted and the original a/b material is preserved.
+        amounts, accepted = self.effective_amounts()
+        self.assertEqual(accepted, [])
+        self.assertEqual(amounts, {"a": 10, "b": 20})
+        self.assertEqual(len(amounts), 2)  # no duplicated identity
+        self.assertIn("do not treat", out)
+
+    def test_duplicate_identities_within_one_production_blocked(self):
+        cset = self.cset_path({
+            "set_id": "dup",
+            "operations": [{
+                "op_id": "dup-a", "relation": "split",
+                "retracts": ["a"],
+                "records": [
+                    {"id": "z", "department": "g", "amount": 4},
+                    {"id": "z", "department": "g", "amount": 6},
+                ],
+            }],
+        })
+        code, out = self.run_cli(
+            cset, "--confirm-op", "dup-a", "--accept", "all",
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("produces duplicate identity", out)
+        amounts, accepted = self.effective_amounts()
+        self.assertEqual(accepted, [])
+        self.assertEqual(amounts, {"a": 10, "b": 20})
+
+    def test_only_conflicting_scope_blocked_in_same_batch(self):
+        cset = self.cset_path({
+            "set_id": "multi",
+            "operations": [
+                {"op_id": "ok-split-b", "relation": "split",
+                 "retracts": ["b"],
+                 "records": [
+                     {"id": "b1", "department": "g", "amount": 14},
+                     {"id": "b2", "department": "g", "amount": 6},
+                 ]},
+                {"op_id": "bad-collision", "relation": "amend",
+                 "retracts": ["a"],
+                 "records": [
+                     {"id": "b1", "department": "g", "amount": 9},
+                 ]},
+             ],
+         })
+        code, out = self.run_cli(
+            cset,
+            "--confirm-op", "ok-split-b,bad-collision",
+            "--accept", "all",
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("op 'bad-collision'", out)
+        self.assertNotIn("op 'ok-split-b' would overwrite", out)
+        # Only the conflicting op is blocked; the independent split of b
+        # is accepted in the same run.
+        amounts, accepted = self.effective_amounts()
+        self.assertEqual(accepted, ["ok-split-b"])
+        self.assertEqual(amounts, {"a": 10, "b1": 14, "b2": 6})
+
+    def test_independent_correction_accepted_alongside_blocked_one(self):
+        cset = self.cset_path({
+            "set_id": "multi2",
+            "operations": [
+                {"op_id": "indep", "relation": "amend",
+                 "retracts": ["b"],
+                 "records": [
+                     {"id": "b", "department": "g", "amount": 21},
+                 ]},
+                {"op_id": "bad", "relation": "split",
+                 "retracts": ["a"],
+                 "records": [
+                     {"id": "x", "department": "g", "amount": 4},
+                     {"id": "b", "department": "g", "amount": 6},
+                 ]},
+            ],
+        })
+        code, out = self.run_cli(
+            cset,
+            "--confirm-op", "indep,bad", "--accept", "all",
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("would overwrite", out)
+        amounts, accepted = self.effective_amounts()
+        # Independent correction still goes through; bad one is refused.
+        self.assertEqual(accepted, ["indep"])
+        self.assertEqual(amounts, {"a": 10, "b": 21})
+        self.assertEqual(sum(amounts.values()), 31)
+
+    def test_conflict_appearing_after_save_and_reopen_is_blocked(self):
+        first = self.cset_path({
+            "set_id": "first",
+            "operations": [{
+                "op_id": "a-to-x", "relation": "amend",
+                "retracts": ["a"],
+                "records": [
+                    {"id": "x", "department": "g", "amount": 10},
+                ],
+            }],
+        }, name="first.json")
+        code, _ = self.run_cli(
+            first, "--confirm-op", "a-to-x", "--accept", "all",
+        )
+        self.assertEqual(code, 0)
+
+        # Later, another correction tries to reuse the now-live identity x
+        # produced by the previously accepted (saved) correction.
+        second = self.cset_path({
+            "set_id": "second",
+            "operations": [{
+                "op_id": "b-to-x", "relation": "amend",
+                "retracts": ["b"],
+                "records": [
+                    {"id": "x", "department": "g", "amount": 20},
+                ],
+            }],
+        }, name="second.json")
+        code, out = self.run_cli(
+            second, "--confirm-op", "b-to-x", "--accept", "all",
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("a-to-x", out)
+        amounts, accepted = self.effective_amounts()
+        self.assertEqual(accepted, ["a-to-x"])
+        self.assertEqual(amounts, {"b": 20, "x": 10})
+
+    def test_retraction_that_resurrects_colliding_identity_is_blocked(self):
+        first = self.cset_path({
+            "set_id": "s1",
+            "operations": [{
+                "op_id": "b-to-c", "relation": "amend",
+                "retracts": ["b"],
+                "records": [
+                    {"id": "c", "department": "g", "amount": 20},
+                ],
+            }],
+        }, name="s1.json")
+        code, _ = self.run_cli(
+            first, "--confirm-op", "b-to-c", "--accept", "all",
+        )
+        self.assertEqual(code, 0)
+        second = self.cset_path({
+            "set_id": "s2", "depends_on": ["s1"],
+            "operations": [{
+                "op_id": "a-to-b", "relation": "amend",
+                "retracts": ["a"],
+                "records": [
+                    {"id": "b", "department": "g", "amount": 10},
+                ],
+            }],
+        }, name="s2.json")
+        code, out = self.run_cli(
+            second, "--confirm-op", "a-to-b", "--accept", "all",
+        )
+        self.assertEqual(code, 0, out)
+
+        # Retracting s1 resurrects the base record b, which collides with
+        # the b produced by still-active s2: refuse and keep current data.
+        buf = io.StringIO()
+        argv = [
+            "--sample", str(self.sample_path),
+            "--rules", str(self.rules_path),
+            "--out", self.out, "--retract-correction", "s1",
+        ]
+        with contextlib.redirect_stdout(buf):
+            code = main(argv)
+        out = buf.getvalue()
+        self.assertEqual(code, 1)
+        self.assertIn("NOT retracted", out)
+        ledger = corr.CorrectionLedger(self.out)
+        self.assertEqual(ledger.retracted_sets(), set())
+
+
 if __name__ == "__main__":
     unittest.main()

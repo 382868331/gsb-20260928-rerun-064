@@ -274,6 +274,139 @@ def effective_batch(batch, accepted_events):
     ), relations
 
 
+def identity_conflicts(base_ids, events, prior_events=()):
+    """Replay retract/produce events and find identity violations.
+
+    Each event is ``(key, retracts, produces)`` where ``key`` labels the
+    event in returned errors (for example an ``op_id``).  A produced id is
+    legal only when it does not already occur among the event's own outputs
+    and, after the event's declared retractions, is not a live record.
+    Records that were never declared retracted or merged away can therefore
+    never be silently overwritten, and a duplicate identity can never enter
+    the effective data.  Returns ``(errors, blocked_keys)``; blocked events
+    are not applied, so unrelated events still replay cleanly.
+    ``prior_events`` are already accepted events that establish the
+    current live state; they are replayed without re-checking but keep
+    their producer labels, so a collision discovered after save/reopen
+    still names the earlier producing op.
+    """
+    errors = []
+    blocked = set()
+    live = {rid: None for rid in base_ids}
+    all_events = list(prior_events) + list(events)
+
+    for index, (key, retracts, produces) in enumerate(all_events):
+        if index < len(prior_events):
+            for rid in set(retracts):
+                live.pop(rid, None)
+            for rid in produces:
+                live[rid] = key
+            continue
+        retract_set = set(retracts)
+        remaining_live = {rid for rid in live if rid not in retract_set}
+
+        duplicated = set()
+        seen = set()
+        for rid in produces:
+            if rid in seen:
+                duplicated.add(rid)
+            seen.add(rid)
+
+        collisions = {
+            rid for rid in set(produces) if rid in remaining_live
+        }
+
+        if duplicated:
+            for rid in sorted(duplicated):
+                errors.append(
+                    f"op {key!r} produces duplicate identity {rid!r} "
+                    "within the same correction"
+                )
+        if collisions:
+            for rid in sorted(collisions):
+                producer = live[rid]
+                if producer is None:
+                    holder = "the current effective data"
+                else:
+                    holder = f"live record produced by op {producer!r}"
+                errors.append(
+                    f"op {key!r} would overwrite {holder} with produced "
+                    f"identity {rid!r}, but {rid!r} is not declared in "
+                    "retracts; the affected correction is blocked and "
+                    "the original record is preserved"
+                )
+
+        if duplicated or collisions:
+            blocked.add(key)
+            continue
+
+        for rid in retract_set:
+            live.pop(rid, None)
+        for rid in produces:
+            live[rid] = key
+
+    return errors, blocked
+
+
+def check_acceptance_identities(batch, ledger, cset, op_ids):
+    """Check candidate ops against the currently effective data.
+
+    The baseline is the base batch plus every accepted correction that is
+    still active, so conflicts introduced after a save/reopen (including a
+    name colliding with a record produced by an earlier accepted set) are
+    caught before acceptance.
+    """
+    wanted = set(op_ids)
+    candidates = [
+        op for op in cset["ops"] if op["op_id"] in wanted
+    ]
+    active = ledger.active_accepted()
+    prior_events = [
+        (
+            event["op_id"],
+            tuple(event.get("retracts", ())),
+            tuple(event.get("produces", ())),
+        )
+        for event in active
+    ]
+    events = [
+        (
+            op["op_id"],
+            tuple(op["retracts"]),
+            tuple(op["produces"]),
+        )
+        for op in candidates
+    ]
+    return identity_conflicts(
+        [r.record_id for r in batch.records], events,
+        prior_events=prior_events,
+    )
+
+
+def check_retraction_identities(batch, ledger, set_id):
+    """Check the effective data left after retracting one correction set.
+
+    Retracting a set can resurrect base records or expose records produced
+    by independent sets; the retraction is refused when that would leave a
+    produced identity colliding with a still-live record.
+    """
+    remaining = [
+        event for event in ledger.active_accepted()
+        if event["set_id"] != set_id
+    ]
+    events = [
+        (
+            f"{event['set_id']}:{event['op_id']}",
+            tuple(event.get("retracts", ())),
+            tuple(event.get("produces", ())),
+        )
+        for event in remaining
+    ]
+    return identity_conflicts(
+        [r.record_id for r in batch.records], events,
+    )
+
+
 def _fact_value(record, field):
     """The value(s) an issue is about, for same-fact comparison."""
     names = field.split(",") if field else ()
