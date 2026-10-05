@@ -166,3 +166,32 @@ python -m dq_platform.cli --sample samples/employees_v1.json \
 
 完整流程（部分接受后恢复、拆分/合并继承、循环与互斥阻止、撤回后
 依据丢失）见 `tests/test_corrections.py`。
+
+## 相互依赖的更正组合规划（第六轮）
+
+一项更正可以使用另一项尚未接受的更正产出的记录：把它们写进同一个
+候选链文件（`--chain`），系统推导可接受顺序与最终分组总额，并逐项
+区分链内合法接续（`ok`）、身份冲突（`identity_conflict`）、循环
+依赖（`cycle`）与缺少前置记录（`missing_prerequisite`）。
+
+```bash
+python -m dq_platform.cli --sample samples/department_amounts.json \
+  --rules samples/rules_dependent_sum.json --out results \
+  --chain samples/chain_split_merge.json \
+  --confirm-op split-d1-001,merge-d1-parts --accept merge-d1-parts
+```
+
+- 接受按依赖闭包进行：请求下游操作会自动带上链内前置，前置不可
+  接受（冲突/成环/缺前置）或未被确认时，下游一并保持候选；依赖
+  尚未生效的下游绝不能单独接受。未接受的部分继续是候选，不进入
+  有效数据。
+- 接受按推导顺序重放，只撤回/产生声明过的身份，顺序变化不会覆盖
+  无关资料；`[chain:totals]` 输出接受前后的分组总额便于核对金额
+  守恒。
+- 规划每次运行都从当前样本与账本重建：接受前资料改变会重新核对
+  受影响链（前置记录消失即标 `missing_prerequisite`），已经接受
+  的独立更正保持有效；中途撤回前置更正后，下游在重新规划中立即
+  失去依据。
+
+先拆分再合并、两个候选争用同一原记录、中途撤回前置更正的完整核对
+（含实际记录与金额守恒）见 `tests/test_chains.py`。

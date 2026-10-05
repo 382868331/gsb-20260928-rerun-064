@@ -4,6 +4,12 @@ import argparse
 import sys
 
 from .engine import evaluate
+from .chains import (
+    OK,
+    dependency_closure,
+    load_correction_chain,
+    plan_chain,
+)
 from .corrections import (
     CorrectionLedger,
     DecisionLedger,
@@ -59,6 +65,10 @@ def main(argv=None):
         help="correction set JSON with retract/replace operations",
     )
     parser.add_argument(
+        "--chain", default=None,
+        help="correction chain JSON with mutually dependent candidate ops",
+    )
+    parser.add_argument(
         "--accept", default="",
         help="comma-separated correction op ids to accept, or 'all'",
     )
@@ -83,6 +93,8 @@ def main(argv=None):
     store = ResultStore(args.out)
     if args.retract_correction:
         return _retract_correction(args)
+    if args.chain:
+        return _run_chain(args, batch, rules, version_set, store)
     if args.corrections:
         return _run_corrections(args, batch, rules, version_set, store)
     prev_result = None
@@ -195,6 +207,136 @@ def _retract_correction(args):
     if not lost:
         print("  no manual decisions depended on this set")
     return 1 if lost else 0
+
+
+def _run_chain(args, batch, rules, version_set, store):
+    chain = load_correction_chain(args.chain)
+    ledger = CorrectionLedger(args.out)
+    chain_id = chain["chain_id"]
+    for op_id in _split_csv(args.confirm_op):
+        op = next((o for o in chain["ops"] if o["op_id"] == op_id), None)
+        if op is None:
+            raise SystemExit(f"unknown op to confirm: {op_id}")
+        ledger.confirm(chain_id, op_id, op["relation"])
+
+    # The plan is rebuilt from the live batch and ledger on every run, so
+    # data changed before acceptance re-validates every affected chain
+    # while already accepted independent corrections stay valid.
+    active = ledger.active_accepted()
+    plan = plan_chain(chain, batch, active)
+    for op_id in plan["pending"]:
+        status = plan["status"][op_id]
+        reason = "; ".join(plan["reasons"][op_id]) or "legal continuation"
+        print(f"  [chain:{status}] op={op_id} :: {reason}")
+    if plan["order"]:
+        print("  [chain:order] " + " -> ".join(plan["order"]))
+    for error in plan["errors"]:
+        print(f"  [chain:error] {error}")
+    if chain["amount_field"]:
+        print(
+            "  [chain:totals] before="
+            + json_dumps_totals(plan["totals_before"])
+            + " after=" + json_dumps_totals(plan["totals"])
+        )
+
+    confirmed = ledger.confirmed_ops()
+
+    def is_confirmed(op):
+        return (
+            op["confirmed"]
+            or (chain_id, op["op_id"]) in confirmed
+        )
+
+    accept_arg = set(_split_csv(args.accept))
+    pending = plan["pending"]
+    if "all" in accept_arg:
+        requested = set(pending)
+    else:
+        unknown = accept_arg - {op["op_id"] for op in chain["ops"]}
+        if unknown:
+            raise SystemExit(
+                "unknown op ids: " + ", ".join(sorted(unknown))
+            )
+        requested = accept_arg & set(pending)
+    acceptable, blocked = dependency_closure(plan, requested)
+    rejected = set()
+    for op_id in sorted(blocked & requested):
+        print(
+            f"  [blocked] op {op_id} cannot be accepted: dependency "
+            "closure is not fully acceptable; it stays candidate"
+        )
+        rejected.add(op_id)
+    by_id = {op["op_id"]: op for op in chain["ops"]}
+    accepted_now = []
+    for op_id in plan["order"]:
+        if op_id not in acceptable:
+            continue
+        op = by_id[op_id]
+        deps = plan["edges"].get(op_id, ())
+        if any(dep in rejected for dep in deps):
+            print(
+                f"  [blocked] op {op_id} depends on a prerequisite that "
+                "was not accepted; it stays candidate"
+            )
+            rejected.add(op_id)
+            continue
+        if not is_confirmed(op):
+            print(
+                f"  [blocked] op {op_id} needs explicit confirmation "
+                "(--confirm-op) before its relation is applied"
+            )
+            rejected.add(op_id)
+            continue
+        ledger.accept(chain_id, op)
+        accepted_now.append(op_id)
+    still_pending = [
+        op_id for op_id in plan["pending"]
+        if op_id not in set(accepted_now)
+    ]
+    for op_id in still_pending:
+        print(
+            f"  [pending] op {op_id} stays candidate; excluded from "
+            "this run's effective data"
+        )
+
+    eff_batch, _ = effective_batch(batch, ledger.active_accepted())
+    result = evaluate(eff_batch, rules)
+    store.append(result)
+    print(
+        f"chain={chain_id} accepted={len(accepted_now)} "
+        f"pending={len(still_pending)} "
+        f"effective_records={len(eff_batch.records)}"
+    )
+    print(
+        f"batch={result.batch_id} rules={version_set} "
+        f"status={result.status}"
+    )
+    for issue in result.issues:
+        print(
+            f"  [{issue.kind}] record={issue.record_id} "
+            f"rule={issue.rule_id} field={issue.field} :: {issue.detail}"
+        )
+    for error in result.errors:
+        print(f"  [error] {error}")
+    if rejected:
+        print(
+            "chain acceptance partially blocked; affected scope stays "
+            "candidate and current effective data was preserved"
+        )
+        return 1
+    if result.status == "PASSED":
+        print(f"all {len(eff_batch.records)} records passed")
+        return 0
+    print("check FAILED - do not treat the batch as qualified")
+    return 1
+
+
+def json_dumps_totals(totals):
+    import json as _json
+    return _json.dumps(
+        {"/".join(key): value for key, value in sorted(totals.items())},
+        ensure_ascii=False, sort_keys=True,
+    )
 
 
 def _run_corrections(args, batch, rules, version_set, store):

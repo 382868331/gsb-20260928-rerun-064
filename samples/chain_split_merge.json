@@ -1,0 +1,24 @@
+{
+  "chain_id": "chain-20261005-01",
+  "amount_field": "amount",
+  "group_fields": ["department"],
+  "operations": [
+    {
+      "op_id": "split-d1-001",
+      "relation": "split",
+      "retracts": ["D1-001"],
+      "records": [
+        {"id": "D1-001a", "department": "sales", "amount": 25},
+        {"id": "D1-001b", "department": "sales", "amount": 35}
+      ]
+    },
+    {
+      "op_id": "merge-d1-parts",
+      "relation": "merge",
+      "retracts": ["D1-001a", "D1-001b"],
+      "records": [
+        {"id": "D1-001m", "department": "sales", "amount": 60}
+      ]
+    }
+  ]
+}
