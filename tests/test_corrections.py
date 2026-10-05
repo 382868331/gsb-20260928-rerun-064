@@ -224,6 +224,194 @@ class ValidationTests(unittest.TestCase):
         self.assertTrue("still depend" in errors[0])
 
 
+class CandidateChainPlanTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def load_ops(self, doc):
+        return self._load(doc)["ops"]
+
+    def _load(self, doc):
+        path = write_cset(self.tmp.name, doc)
+        return corr.load_correction_set(path)
+
+    def batch(self):
+        return load_batch_write(self.tmp.name, [
+            {"id": "a", "department": "g", "amount": 10},
+            {"id": "z", "department": "g", "amount": 30},
+        ])
+
+    def split_merge_ops(self):
+        return self.load_ops({
+            "set_id": "chain",
+            "operations": [
+                {"op_id": "merge-a", "relation": "merge",
+                 "retracts": ["a1", "a2"],
+                 "records": [
+                     {"id": "a", "department": "g", "amount": 10},
+                 ]},
+                {"op_id": "split-a", "relation": "split",
+                 "retracts": ["a"],
+                 "records": [
+                     {"id": "a1", "department": "g", "amount": 4},
+                     {"id": "a2", "department": "g", "amount": 6},
+                 ]},
+            ],
+        })
+
+    def test_split_then_merge_is_ordered_and_amount_conserved(self):
+        plan = corr.plan_candidate_chains(
+            self.batch(), (), self.split_merge_ops(),
+        )
+        self.assertEqual(plan["order"], ("split-a", "merge-a"))
+        self.assertEqual(plan["blocked"], set())
+        self.assertEqual(plan["errors"], ())
+        self.assertEqual(plan["chains"][0]["status"], "legal")
+        self.assertEqual(plan["group_totals"], {"g": 40})
+        self.assertEqual(
+            [record.record_id for record in plan["projected_records"]],
+            ["z", "a"],
+        )
+
+    def test_downstream_cannot_be_selected_without_pending_upstream(self):
+        plan = corr.plan_candidate_chains(
+            self.batch(), (), self.split_merge_ops(),
+            selected=("merge-a",),
+        )
+        self.assertEqual(plan["order"], ())
+        self.assertIn("merge-a", plan["blocked"])
+        self.assertTrue(any(
+            "required prerequisite" in error for error in plan["errors"]
+        ))
+
+    def test_identity_conflict_cycle_and_missing_prerequisite_are_classified(self):
+        ops = self.load_ops({
+            "set_id": "cases",
+            "operations": [
+                {"op_id": "claim-one", "relation": "split",
+                 "retracts": ["a"],
+                 "records": [
+                     {"id": "one", "department": "g", "amount": 4},
+                     {"id": "two", "department": "g", "amount": 6},
+                 ]},
+                {"op_id": "claim-two", "relation": "amend",
+                 "retracts": ["a"],
+                 "records": [
+                     {"id": "other", "department": "g", "amount": 10},
+                 ]},
+                {"op_id": "cycle-x", "relation": "amend",
+                 "depends_on": ["cycle-z"], "retracts": ["x"],
+                 "records": [{"id": "y"}]},
+                {"op_id": "cycle-y", "relation": "amend",
+                 "depends_on": ["cycle-x"], "retracts": ["y"],
+                 "records": [{"id": "z"}]},
+                {"op_id": "cycle-z", "relation": "amend",
+                 "depends_on": ["cycle-y"], "retracts": ["z"],
+                 "records": [{"id": "x"}]},
+                {"op_id": "missing", "relation": "retract",
+                 "retracts": ["not-here"]},
+            ],
+        })
+        plan = corr.plan_candidate_chains(self.batch(), (), ops)
+        statuses = {
+            tuple(chain["status"] for chain in plan["chains"]
+                  if "claim-one" in chain["ops"])[0],
+            tuple(chain["status"] for chain in plan["chains"]
+                  if "cycle-x" in chain["ops"])[0],
+            tuple(chain["status"] for chain in plan["chains"]
+                  if "missing" in chain["ops"])[0],
+        }
+        self.assertEqual(
+            statuses,
+            {"identity_conflict", "cycle", "missing_prerequisite"},
+        )
+        self.assertEqual(
+            plan["blocked"],
+            {"claim-one", "claim-two", "cycle-x", "cycle-y", "cycle-z",
+             "missing"},
+        )
+
+    def test_competing_candidates_for_same_produced_record_are_blocked(self):
+        ops = self.load_ops({
+            "set_id": "competing",
+            "operations": [
+                {"op_id": "from-a", "relation": "amend",
+                 "retracts": ["a"],
+                 "records": [
+                     {"id": "x", "department": "g", "amount": 10},
+                 ]},
+                {"op_id": "from-z", "relation": "amend",
+                 "retracts": ["z"],
+                 "records": [
+                     {"id": "x", "department": "g", "amount": 30},
+                 ]},
+            ],
+        })
+        plan = corr.plan_candidate_chains(self.batch(), (), ops)
+        self.assertEqual(plan["order"], ())
+        self.assertEqual(plan["blocked"], {"from-a", "from-z"})
+        self.assertTrue(any("competing candidates" in error
+                            for error in plan["errors"]))
+
+    def test_amount_failure_blocks_chain_but_keeps_independent_correction(self):
+        ops = self.load_ops({
+            "set_id": "amount",
+            "operations": [
+                {"op_id": "bad-split", "relation": "split",
+                 "retracts": ["a"],
+                 "records": [
+                     {"id": "a1", "department": "g", "amount": 4},
+                     {"id": "a2", "department": "g", "amount": 5},
+                 ]},
+                {"op_id": "bad-merge", "relation": "merge",
+                 "retracts": ["a1", "a2"],
+                 "records": [
+                     {"id": "a", "department": "g", "amount": 9},
+                 ]},
+                {"op_id": "independent-retract", "relation": "retract",
+                 "retracts": ["z"]},
+            ],
+        })
+        plan = corr.plan_candidate_chains(self.batch(), (), ops)
+        self.assertEqual(plan["order"], ("independent-retract",))
+        self.assertIn("bad-split", plan["blocked"])
+        self.assertIn("bad-merge", plan["blocked"])
+        self.assertNotIn("independent-retract", plan["blocked"])
+        self.assertEqual(
+            [record.record_id for record in plan["projected_records"]],
+            ["a"],
+        )
+
+    def test_acceptance_time_data_change_rechecks_actual_records(self):
+        ledger = corr.CorrectionLedger(self.tmp.name)
+        ledger.accept("independent", {
+            "op_id": "independent-retract", "relation": "retract",
+            "retracts": ("z",), "records": (), "produces": (),
+        })
+        plan = corr.plan_candidate_chains(
+            self.batch(), ledger.active_accepted(), self.split_merge_ops(),
+        )
+        self.assertEqual(plan["order"], ("split-a", "merge-a"))
+        self.assertEqual(
+            [record.record_id for record in plan["projected_records"]],
+            ["a"],
+        )
+        self.assertEqual(plan["group_totals"], {"g": 10})
+
+    def test_unknown_operation_dependency_is_rejected_when_loading(self):
+        with self.assertRaises(corr.CorrectionError):
+            self._load({
+                "set_id": "bad-dep",
+                "operations": [{
+                    "op_id": "op", "relation": "retract",
+                    "depends_on": ["missing-op"], "retracts": ["a"],
+                }],
+            })
+
+
 def load_batch_write(tmp_path, records):
     path = Path(tmp_path) / "sample.json"
     path.write_text(json.dumps(records), encoding="utf-8")
@@ -464,6 +652,47 @@ class CliFlowTests(unittest.TestCase):
         self.assertIn("needs explicit confirmation", out)
         ledger = corr.CorrectionLedger(self.out)
         self.assertEqual(ledger.active_accepted(), [])
+
+    def test_cli_accepts_reverse_candidate_chain_in_required_order(self):
+        sample = Path(self.tmp.name) / "chain.json"
+        correction_file = Path(self.tmp.name) / "chain-corrections.json"
+        sample.write_text(json.dumps([
+            {"id": "a", "department": "g", "amount": 10},
+            {"id": "z", "department": "g", "amount": 30},
+        ]), encoding="utf-8")
+        correction_file.write_text(json.dumps({
+            "set_id": "chain", "amount_field": "amount",
+            "group_fields": ["department"],
+            "operations": [
+                {"op_id": "merge-parts", "relation": "merge",
+                 "retracts": ["a1", "a2"],
+                 "records": [
+                     {"id": "a", "department": "g", "amount": 10},
+                 ]},
+                {"op_id": "split-source", "relation": "split",
+                 "retracts": ["a"],
+                 "records": [
+                     {"id": "a1", "department": "g", "amount": 4},
+                     {"id": "a2", "department": "g", "amount": 6},
+                 ]},
+            ],
+        }), encoding="utf-8")
+        code, out = self.run_cli(
+            "--sample", str(sample), "--rules", self.rules,
+            "--out", self.out, "--corrections", str(correction_file),
+            "--confirm-op", "merge-parts,split-source",
+            "--accept", "merge-parts,split-source",
+        )
+        self.assertEqual(code, 1)
+        self.assertIn(
+            "planned order: split-source -> merge-parts", out,
+        )
+        self.assertIn("projected group totals: g=40", out)
+        ledger = corr.CorrectionLedger(self.out)
+        self.assertEqual(
+            [event["op_id"] for event in ledger.active_accepted()],
+            ["split-source", "merge-parts"],
+        )
 
     def test_partial_acceptance_then_resume_matches_full_recompute(self):
         # Accept only the amend; the split stays pending and unmixed.

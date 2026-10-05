@@ -12,6 +12,7 @@ from .corrections import (
     inherited_issue_count,
     load_correction_set,
     migrate_issues,
+    plan_candidate_chains,
     resolution_count,
     validate_acceptance_scope,
     validate_correction_set,
@@ -206,8 +207,11 @@ def _run_corrections(args, batch, rules, version_set, store):
             raise SystemExit(f"unknown op to confirm: {op_id}")
         ledger.confirm(cset["set_id"], op_id, op["relation"])
 
+    prior_active = ledger.active_accepted()
+    prior_effective, _ = effective_batch(batch, prior_active)
+    current_ids = {record.record_id for record in prior_effective.records}
     relation_errors, relation_blocked = validate_correction_set(
-        cset, ledger,
+        cset, ledger, current_ids=current_ids,
     )
     for error in relation_errors:
         print(f"  [blocked] {error}")
@@ -220,7 +224,6 @@ def _run_corrections(args, batch, rules, version_set, store):
             or (cset["set_id"], op["op_id"]) in confirmed
         )
 
-    prior_active = ledger.active_accepted()
     already = {
         e["op_id"] for e in prior_active if e["set_id"] == cset["set_id"]
     }
@@ -236,20 +239,38 @@ def _run_corrections(args, batch, rules, version_set, store):
         pending if "all" in accept_arg
         else [op for op in pending if op["op_id"] in accept_arg]
     )
-    identity_errors, identity_blocked = validate_acceptance_scope(
+    plan = plan_candidate_chains(
         batch, prior_active, requested_ops,
+        selected=[op["op_id"] for op in requested_ops],
+        amount_field=cset["amount_field"],
+        group_fields=cset["group_fields"],
+    )
+    requested_by_id = {op["op_id"]: op for op in requested_ops}
+    ordered_requested = [
+        requested_by_id[op_id] for op_id in plan["order"]
+        if op_id in requested_by_id
+    ]
+    identity_errors, identity_blocked = validate_acceptance_scope(
+        batch, prior_active, ordered_requested,
     )
     for error in identity_errors:
         print(f"  [blocked] {error}")
-    blocked = relation_blocked | identity_blocked
+    for error in plan["errors"]:
+        print(f"  [blocked] {error}")
+    blocked = relation_blocked | identity_blocked | plan["blocked"]
     if "all" in accept_arg:
         to_accept = [
-            op for op in requested_ops
+            op for op in ordered_requested
             if is_confirmed(op) and op["op_id"] not in blocked
         ]
     else:
-        to_accept = requested_ops
+        to_accept = ordered_requested
     rejected = set()
+    rejected.update(
+        op["op_id"] for op in requested_ops
+        if op["op_id"] in blocked
+    )
+    to_accept = [op for op in to_accept if op["op_id"] not in rejected]
     for op in to_accept:
         if op["op_id"] in blocked:
             print(
@@ -307,6 +328,20 @@ def _run_corrections(args, batch, rules, version_set, store):
         f"pending={len(skipped)} "
         f"effective_records={len(eff_batch.records)}"
     )
+    if plan["order"]:
+        print("  [candidate-chain] planned order: " + " -> ".join(plan["order"]))
+        if plan["group_totals"]:
+            totals = ", ".join(
+                f"{group}={total}"
+                for group, total in plan["group_totals"].items()
+            )
+            print(f"  [candidate-chain] projected group totals: {totals}")
+    for chain in plan["chains"]:
+        if chain["status"] != "legal":
+            print(
+                "  [candidate-chain:"
+                f"{chain['status']}] {','.join(chain['ops'])}"
+            )
     for rel in new_relations:
         print(
             f"  [relation:{rel['relation']}] op={rel['op_id']} "

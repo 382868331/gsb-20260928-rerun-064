@@ -74,18 +74,32 @@ def load_correction_set(path):
                 f"op {op_id!r}: relation {relation!r} does not match "
                 f"retracts={len(retracts)} records={len(records)}"
             )
+        op_deps = tuple(str(d) for d in item.get("depends_on", ()))
         ops.append({
             "op_id": op_id,
             "relation": relation,
-            "depends_on": tuple(str(d) for d in doc.get("depends_on", ())),
+            "depends_on": op_deps,
+            "set_depends_on": tuple(str(d) for d in doc.get("depends_on", ())),
             "retracts": retracts,
             "records": records,
             "produces": produces,
             "confirmed": bool(item.get("confirmed", False)),
         })
+    op_ids = {op["op_id"] for op in ops}
+    for op in ops:
+        unknown = [dep for dep in op["depends_on"] if dep not in op_ids]
+        if unknown:
+            raise CorrectionError(
+                f"op {op['op_id']!r} depends on unknown operation(s): "
+                + ", ".join(unknown)
+            )
     return {
         "set_id": doc["set_id"],
         "depends_on": tuple(str(d) for d in doc.get("depends_on", ())),
+        "amount_field": str(doc.get("amount_field", "amount")),
+        "group_fields": tuple(str(f) for f in doc.get("group_fields", (
+            "department",
+        ))),
         "ops": tuple(ops),
     }
 
@@ -124,7 +138,10 @@ class CorrectionLedger:
             "set_id": set_id,
             "op_id": op["op_id"],
             "relation": op["relation"],
-            "depends_on": list(op.get("depends_on", ())),
+            "depends_on": list(
+                op.get("set_depends_on", op.get("depends_on", ()))
+            ),
+            "op_depends_on": list(op.get("depends_on", ())),
             "retracts": list(op["retracts"]),
             "records": list(op["records"]),
             "produces": list(op["produces"]),
@@ -188,7 +205,7 @@ def validate_set_retraction(set_id, active_events):
     return errors, dependents
 
 
-def validate_correction_set(cset, ledger):
+def validate_correction_set(cset, ledger, current_ids=None):
     """Return (errors, blocked_op_ids) for an incoming correction set.
 
     Blocks confirmation of the affected scope when: the set depends on
@@ -213,6 +230,7 @@ def validate_correction_set(cset, ledger):
 
     # Mutually exclusive replacements of the same old record.
     claimant = {}
+    current_ids = set(current_ids or ())
     for op in cset["ops"]:
         for rid in op["retracts"]:
             other = claimant.get(rid)
@@ -240,6 +258,8 @@ def validate_correction_set(cset, ledger):
         node = (set_id, op["op_id"])
         edges.setdefault(node, set())
         for rid in op["retracts"]:
+            if rid in current_ids:
+                continue
             producer = produced_by.get(rid)
             if producer is not None and producer != node:
                 edges[node].add(producer)
@@ -267,6 +287,336 @@ def validate_correction_set(cset, ledger):
         names = " -> ".join(op for _, op in sorted(in_cycle))
         errors.append(f"retraction cycle among corrections: {names}")
     return errors, blocked
+
+
+def _numeric_amount(record_data, amount_field):
+    value = record_data.get(amount_field)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
+
+
+def _group_key(record_data, group_fields):
+    if not group_fields:
+        return "(all records)"
+    return tuple(record_data.get(field) for field in group_fields)
+
+
+def _group_totals(records, amount_field, group_fields):
+    totals = {}
+    for record in records:
+        amount = _numeric_amount(record.data, amount_field)
+        if amount is None:
+            continue
+        key = _group_key(record.data, group_fields)
+        totals[key] = totals.get(key, 0) + amount
+    return {
+        "|".join(str(part) for part in key)
+        if isinstance(key, tuple) else key: total
+        for key, total in sorted(totals.items(), key=lambda item: str(item[0]))
+    }
+
+
+def _candidate_graph(ops, current_ids):
+    ops_by_id = {op["op_id"]: op for op in ops}
+    produced_by = {}
+    duplicate_producers = set()
+    for op in ops:
+        for rid in op["produces"]:
+            if rid in produced_by:
+                duplicate_producers.add(rid)
+            produced_by.setdefault(rid, op["op_id"])
+
+    edges = {op["op_id"]: {"explicit": set(), "produced": set()}
+             for op in ops}
+    for op in ops:
+        for dep in op["depends_on"]:
+            if dep in ops_by_id:
+                edges[op["op_id"]]["explicit"].add(dep)
+        for rid in op["retracts"]:
+            if rid in current_ids:
+                continue
+            producer = produced_by.get(rid)
+            if producer and producer != op["op_id"]:
+                edges[op["op_id"]]["produced"].add(producer)
+
+    claimants = {}
+    identity_conflicts = set()
+    for op in ops:
+        for rid in op["retracts"]:
+            other = claimants.get(rid)
+            if other and other != op["op_id"]:
+                identity_conflicts.add(other)
+                identity_conflicts.add(op["op_id"])
+            claimants.setdefault(rid, op["op_id"])
+
+    missing = {}
+    for op in ops:
+        absent = tuple(
+            rid for rid in op["retracts"]
+            if rid not in current_ids and rid not in produced_by
+        )
+        if absent:
+            missing[op["op_id"]] = absent
+
+    combined = {
+        op_id: dependencies["explicit"] | dependencies["produced"]
+        for op_id, dependencies in edges.items()
+    }
+    cycle_nodes = set()
+    for start in combined:
+        visiting = set()
+        stack = []
+
+        def visit(node):
+            if node in visiting:
+                cycle_nodes.update(stack[stack.index(node):])
+                return
+            if node in cycle_nodes:
+                return
+            visiting.add(node)
+            stack.append(node)
+            for prerequisite in combined.get(node, ()):
+                visit(prerequisite)
+            stack.pop()
+            visiting.discard(node)
+
+        visit(start)
+
+    return {
+        "edges": edges,
+        "combined": combined,
+        "produced_by": produced_by,
+        "duplicate_producers": duplicate_producers,
+        "identity_conflicts": identity_conflicts,
+        "missing": missing,
+        "cycle_nodes": cycle_nodes,
+    }
+
+
+def _closure(op_ids, dependencies):
+    result = set(op_ids)
+    changed = True
+    while changed:
+        changed = False
+        for op_id in list(result):
+            for prerequisite in dependencies.get(op_id, ()):
+                if prerequisite not in result:
+                    result.add(prerequisite)
+                    changed = True
+    return result
+
+
+def _topological_order(op_ids, dependencies):
+    remaining = set(op_ids)
+    ordered = []
+    while remaining:
+        ready = sorted(
+            op_id for op_id in remaining
+            if not (dependencies.get(op_id, set()) & remaining)
+        )
+        if not ready:
+            return ordered, True
+        for op_id in ready:
+            ordered.append(op_id)
+            remaining.remove(op_id)
+    return ordered, False
+
+
+def _simulate_ordered_ops(current_records, op_by_id, ordered, amount_field,
+                          dependencies):
+    records = list(current_records)
+    failures = {}
+    applied = []
+    for op_id in ordered:
+        if not dependencies.get(op_id, set()).issubset(set(applied)):
+            failures[op_id] = "its upstream correction has not taken effect"
+            continue
+        op = op_by_id[op_id]
+        by_id = {record.record_id: record for record in records}
+        retract_records = [by_id.get(rid) for rid in op["retracts"]]
+        if any(record is None for record in retract_records):
+            absent = [rid for rid in op["retracts"] if rid not in by_id]
+            failures[op_id] = (
+                "retracts missing current identity "
+                + ", ".join(absent)
+            )
+            continue
+        input_amounts = [
+            _numeric_amount(record.data, amount_field)
+            for record in retract_records
+        ]
+        output_amounts = [
+            _numeric_amount(record_data, amount_field)
+            for record_data in op["records"]
+        ]
+        if op["relation"] in ("split", "merge") and all(
+                value is not None for value in input_amounts + output_amounts
+        ) and sum(input_amounts) != sum(output_amounts):
+            failures[op_id] = (
+                f"violates amount conservation: {sum(input_amounts)} -> "
+                f"{sum(output_amounts)}"
+            )
+            continue
+        remaining = {record.record_id for record in records}
+        remaining.difference_update(op["retracts"])
+        collisions = [rid for rid in op["produces"] if rid in remaining]
+        if collisions:
+            failures[op_id] = (
+                "produces existing identity "
+                + ", ".join(repr(rid) for rid in collisions)
+                + " but does not declare it in retracts"
+            )
+            continue
+        for rid in op["retracts"]:
+            records = [record for record in records if record.record_id != rid]
+        for index, record_data in enumerate(op["records"]):
+            records.append(Record(
+                record_id=op["produces"][index],
+                index=len(records),
+                data=record_data,
+            ))
+        applied.append(op_id)
+    return records, applied, failures
+
+
+def plan_candidate_chains(batch, accepted_events, ops, selected=None,
+                          amount_field="amount",
+                          group_fields=("department",)):
+    current_batch, _ = effective_batch(batch, accepted_events)
+    current_ids = {record.record_id for record in current_batch.records}
+    op_by_id = {op["op_id"]: op for op in ops}
+    graph = _candidate_graph(ops, current_ids)
+    dependencies = graph["combined"]
+
+    selected_ids = (
+        {op["op_id"] for op in ops} if selected is None
+        else {str(op_id) for op_id in selected}
+    )
+    unknown = sorted(selected_ids - set(op_by_id))
+    errors = [f"unknown candidate operation {op_id!r}" for op_id in unknown]
+    selected_ids -= set(unknown)
+    closed = _closure(selected_ids, dependencies)
+    unselected_prerequisites = sorted(closed - selected_ids)
+    for op_id in unselected_prerequisites:
+        errors.append(
+            f"op {op_id!r} is a required prerequisite that is not selected "
+            "and effective; include the dependency-closed chain or keep "
+            "the downstream operation pending"
+        )
+
+    blocked = set(unknown)
+    if unselected_prerequisites:
+        blocked.update(selected_ids)
+
+    chain_components = []
+    dependents = {op["op_id"]: set() for op in ops}
+    for op_id, prerequisites in dependencies.items():
+        for prerequisite in prerequisites:
+            dependents.setdefault(prerequisite, set()).add(op_id)
+    grouped = set()
+    for op in ops:
+        op_id = op["op_id"]
+        if op_id in grouped:
+            continue
+        related = _closure([op_id], dependencies)
+        frontier = set(related)
+        while frontier:
+            current = frontier.pop()
+            connected = dependencies.get(current, set()) | dependents.get(current, set())
+            for node in connected:
+                if node not in related:
+                    related.add(node)
+                    frontier.add(node)
+        grouped |= related
+        cycle_ops = graph["cycle_nodes"] & related
+        conflict_ops = graph["identity_conflicts"] & related
+        missing_ops = set(graph["missing"]) & related
+        status = "legal"
+        if cycle_ops:
+            status = "cycle"
+        elif conflict_ops:
+            status = "identity_conflict"
+        elif missing_ops:
+            status = "missing_prerequisite"
+        chain_components.append({
+            "ops": tuple(sorted(related)),
+            "status": status,
+            "cycle_ops": tuple(sorted(cycle_ops)),
+            "identity_conflicts": tuple(sorted(conflict_ops)),
+            "missing": {op_id: graph["missing"][op_id]
+                        for op_id in sorted(missing_ops)},
+        })
+
+    for rid in sorted(graph["duplicate_producers"]):
+        producers = sorted(
+            op["op_id"] for op in ops if rid in op["produces"]
+        )
+        errors.append(
+            f"record {rid!r} is produced by competing candidates: "
+            + ", ".join(producers)
+        )
+        blocked.update(producers)
+    claimant_pairs = {}
+    for op in ops:
+        for rid in op["retracts"]:
+            claimant_pairs.setdefault(rid, []).append(op["op_id"])
+    for rid, producers in sorted(claimant_pairs.items()):
+        if len(producers) > 1:
+            for op_id in producers:
+                errors.append(
+                    f"identity conflict: op {op_id!r} contends for current "
+                    f"record {rid!r} with another candidate"
+                )
+                blocked.add(op_id)
+    for op_id, record_ids in sorted(graph["missing"].items()):
+        errors.append(
+            f"op {op_id!r} is missing prerequisite record(s): "
+            + ", ".join(record_ids)
+        )
+        blocked.add(op_id)
+    for op_id in sorted(graph["cycle_nodes"]):
+        errors.append(f"op {op_id!r} is part of a circular dependency")
+        blocked.add(op_id)
+
+    eligible = selected_ids - blocked - set(unselected_prerequisites)
+    ordered, cyclic = _topological_order(eligible, dependencies)
+    if cyclic:
+        blocked.update(eligible)
+        ordered = []
+    projected, applied, simulation_failures = _simulate_ordered_ops(
+        current_batch.records, op_by_id, ordered, amount_field, dependencies,
+    )
+    for op_id in sorted(simulation_failures):
+        errors.append(
+            f"op {op_id!r} {simulation_failures[op_id]}"
+        )
+    if simulation_failures:
+        failed = set(simulation_failures)
+        dependents = _closure(failed, dependencies) - failed
+        blocked.update(failed)
+        blocked.update(dependents & selected_ids)
+        skipped = failed | (dependents & selected_ids)
+        ordered = [op_id for op_id in ordered if op_id not in skipped]
+        projected, applied, more_failures = _simulate_ordered_ops(
+            current_batch.records, op_by_id, ordered, amount_field,
+            dependencies,
+        )
+        blocked.update(more_failures)
+    else:
+        projected, applied = projected, applied
+
+    return {
+        "order": tuple(applied if simulation_failures else ordered),
+        "selected": tuple(sorted(selected_ids)),
+        "blocked": blocked,
+        "errors": tuple(errors),
+        "chains": tuple(chain_components),
+        "group_totals": _group_totals(
+            projected, amount_field, group_fields,
+        ),
+        "projected_records": tuple(projected),
+    }
 
 
 def effective_batch(batch, accepted_events):
